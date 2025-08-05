@@ -76,6 +76,16 @@ const studentResultReportRoutes = require("./routes/studentResultReportRoutes");
 const combinedExamSchemeRoutes = require('./routes/combinedExamSchemeRoutes'); // ✅ NEW
 const finalReportRoutes = require('./routes/finalReportRoutes'); // ✅ NEW
 const finalPDFReportRoute = require('./routes/finalPDFReportRoute'); // ✅ NEW
+const coScholasticAreaRoutes = require("./routes/coScholasticAreaRoutes");
+const coScholasticGradeRoutes = require("./routes/coScholasticGradeRoutes"); // ✅ NEW
+const classCoScholasticAreaRoutes = require('./routes/classCoScholasticAreaRoutes'); // ✅ NEW
+const studentCoScholasticEvaluationRoutes = require('./routes/studentCoScholasticEvaluationRoutes'); // ✅ NEW
+const studentRemarkRoutes = require('./routes/studentRemarkRoutes'); // ✅ NEW
+
+
+
+
+
 
 
 
@@ -205,6 +215,15 @@ app.use("/student-result-report", studentResultReportRoutes);
 app.use('/combined-exam-schemes', combinedExamSchemeRoutes); // ✅ Mount combined exam routes
 app.use('/final-report', finalReportRoutes); // ✅ Consistent style
 app.use('/final-report', finalPDFReportRoute); // ✅ NEW: PDF Final Report Export
+app.use("/co-scholastic-areas", coScholasticAreaRoutes);
+app.use("/co-scholastic-grades", coScholasticGradeRoutes);
+app.use('/class-co-scholastic-areas', classCoScholasticAreaRoutes); // ✅ NEW
+app.use('/coscholastic-evaluations', studentCoScholasticEvaluationRoutes); // ✅ NEW
+app.use('/student-remarks', studentRemarkRoutes); // ✅ Add this line
+
+
+
+
 
 
 
