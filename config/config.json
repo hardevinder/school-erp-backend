@@ -1,0 +1,26 @@
+{
+  "development": {
+    "username": "hardevinder",
+    "password": "Admin@1234567",
+    "database": "FeePanel",
+    "host": "127.0.0.1",
+    "dialect": "mysql",
+    "timezone": "+05:30"
+  },
+  "test": {
+    "username": "hardevinder",
+    "password": "Admin@1234567",
+    "database": "database_test",
+    "host": "127.0.0.1",
+    "dialect": "mysql",
+    "timezone": "+05:30"
+  },
+  "production": {
+    "username": "hardevinder",
+    "password": "Admin@1234567",
+    "database": "database_production",
+    "host": "127.0.0.1",
+    "dialect": "mysql",
+    "timezone": "+05:30"
+  }
+}
