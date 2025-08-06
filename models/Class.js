@@ -22,17 +22,26 @@ module.exports = (sequelize) => {
 
   // Define associations
   Class.associate = (models) => {
-    // Existing association with FeeStructure
+    // Association with FeeStructure
     Class.hasMany(models.FeeStructure, {
       foreignKey: "class_id",
       as: "FeeStructures",
     });
-    // New association with LessonPlan (many-to-many)
+
+    // Many-to-many with LessonPlan
     Class.belongsToMany(models.LessonPlan, {
       through: "LessonPlanClasses",
       foreignKey: "classId",
       otherKey: "lessonPlanId",
       as: "LessonPlans",
+    });
+
+    // ✅ Many-to-many with ReportCardFormat through ReportCardFormatClass
+    Class.belongsToMany(models.ReportCardFormat, {
+      through: models.ReportCardFormatClass,
+      foreignKey: "class_id",
+      otherKey: "report_card_format_id",
+      as: "reportCardFormats",
     });
   };
 

@@ -294,7 +294,7 @@ exports.lockEvaluations = async (req, res) => {
 
 // ✅ Assigned Classes with Co-Scholastic Mapping
 exports.getAssignedClasses = async (req, res) => {
-  console.log("🔍 req.user:", req.user);
+  // console.log("🔍 req.user:", req.user);
 
   try {
     const teacherId = req.user?.id;
