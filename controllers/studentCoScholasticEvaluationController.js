@@ -1,7 +1,7 @@
 const {
   Student,
   CoScholasticArea,
-  GradeScheme,
+  CoScholasticGrade,
   StudentCoScholasticEvaluation,
   Incharge,
   Class,
@@ -74,27 +74,42 @@ exports.saveEvaluations = async (req, res) => {
     res.status(500).json({ message: "Failed to save evaluations" });
   }
 };
-
-// ✅ Export evaluations Excel template
+// ✅ Export evaluations Excel template (with grade dropdowns + freeze + protection)
 exports.exportEvaluations = async (req, res) => {
   try {
     const { class_id, section_id, term_id } = req.query;
 
+    // ✅ Fetch students
     const students = await Student.findAll({
-      where: { class_id, section_id, status: "enabled", visible: true, roll_number: { [Op.ne]: null } },
+      where: {
+        class_id,
+        section_id,
+        status: "enabled",
+        visible: true,
+        roll_number: { [Op.ne]: null },
+      },
       order: [["roll_number", "ASC"]],
     });
 
-    const areas = await CoScholasticArea.findAll({ order: [["serial_order", "ASC"]] });
+    // ✅ Fetch areas
+    const areas = await CoScholasticArea.findAll({
+      order: [["serial_order", "ASC"]],
+    });
 
+    // ✅ Fetch existing evaluations
     const existing = await StudentCoScholasticEvaluation.findAll({
       where: { class_id, section_id, term_id },
     });
 
+    // ✅ Fetch grades from CoScholasticGrade
     const gradeMap = {};
-    const grades = await GradeScheme.findAll();
+    const grades = await CoScholasticGrade.findAll({
+      order: [["order", "ASC"]],
+      where: { is_active: true },
+    });
     grades.forEach((g) => (gradeMap[g.id] = g.grade));
 
+    // ✅ Map existing evaluations
     const evalMap = {};
     existing.forEach((e) => {
       evalMap[`${e.student_id}_${e.co_scholastic_area_id}`] = {
@@ -104,14 +119,36 @@ exports.exportEvaluations = async (req, res) => {
     });
 
     const workbook = new ExcelJS.Workbook();
+
+    // ✅ Main sheet first
     const sheet = workbook.addWorksheet("Co-Scholastic Entry");
 
+    // ✅ Hidden dropdown sheet
+    const gradeSheet = workbook.addWorksheet("GradeOptions", { state: "veryHidden" });
+    grades.forEach((g, idx) => {
+      gradeSheet.getCell(`A${idx + 1}`).value = g.grade;
+    });
+
+    // ✅ Header row
     const header = ["Roll No", "Student Name"];
     areas.forEach((a) => {
       header.push(`${a.name} - Grade`, `${a.name} - Remarks`);
     });
     sheet.addRow(header);
+    // ✅ Set widths for all columns based on header length
+      sheet.columns.forEach((col, idx) => {
+        const headerText = header[idx] || "";
+        const minWidth = 15;
+        const buffer = 5;
+        col.width = Math.max(headerText.length + buffer, minWidth);
+      });
 
+
+
+    // ✅ Freeze top row and first 2 columns
+    sheet.views = [{ state: "frozen", xSplit: 2, ySplit: 1 }];
+
+    // ✅ Data rows
     students.forEach((s) => {
       const row = [s.roll_number, s.name];
       areas.forEach((a) => {
@@ -122,15 +159,58 @@ exports.exportEvaluations = async (req, res) => {
       sheet.addRow(row);
     });
 
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename=coscholastic-${Date.now()}.xlsx`);
+    // ✅ Apply dropdowns and unlock editable cells
+    const gradeRange = `GradeOptions!$A$1:$A$${grades.length}`;
+    for (let rowIndex = 2; rowIndex <= students.length + 1; rowIndex++) {
+      let colIndex = 3;
+      for (let i = 0; i < areas.length; i++) {
+        const cell = sheet.getCell(rowIndex, colIndex);
+        const remarksCell = sheet.getCell(rowIndex, colIndex + 1);
+
+        cell.dataValidation = {
+          type: "list",
+          allowBlank: true,
+          formulae: [`=${gradeRange}`],
+          showDropDown: true,
+          showErrorMessage: true,
+          errorTitle: "Invalid Grade",
+          error: "Please select a grade from the dropdown",
+        };
+
+        // ✅ Unlock grade and remark cells
+        cell.protection = { locked: false };
+        remarksCell.protection = { locked: false };
+
+        colIndex += 2;
+      }
+    }
+
+    // ✅ Protect entire worksheet with unlocked grade/remarks
+    sheet.protect("coscholastic2025", {
+      selectLockedCells: true,
+      selectUnlockedCells: true,
+      formatColumns: true, // ✅ allow resizing column widths
+    });
+
+    // ✅ Set response headers and send file
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=coscholastic-${Date.now()}.xlsx`
+    );
+
     await workbook.xlsx.write(res);
     res.end();
   } catch (err) {
     console.error("🔥 Error in exportEvaluations:", err);
-    res.status(500).json({ message: "Failed to export Excel" });
+    res.status(500).json({ message: "Failed to export Excel", error: err.message });
   }
 };
+
+
 
 // ✅ Import evaluations from Excel
 exports.importEvaluations = async (req, res) => {
@@ -144,8 +224,13 @@ exports.importEvaluations = async (req, res) => {
 
   const areas = await CoScholasticArea.findAll({ order: [["serial_order", "ASC"]] });
   const gradeMap = {};
-  const grades = await GradeScheme.findAll();
-  grades.forEach((g) => (gradeMap[g.grade.toUpperCase()] = g.id));
+  const grades = await CoScholasticGrade.findAll({
+  where: { is_active: true },
+    });
+    grades.forEach((g) => {
+      gradeMap[g.grade.toUpperCase()] = g.id;
+    });
+
 
   const t = await sequelize.transaction();
   try {
