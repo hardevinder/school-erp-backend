@@ -82,6 +82,9 @@ const classCoScholasticAreaRoutes = require('./routes/classCoScholasticAreaRoute
 const studentCoScholasticEvaluationRoutes = require('./routes/studentCoScholasticEvaluationRoutes'); // ✅ NEW
 const studentRemarkRoutes = require('./routes/studentRemarkRoutes'); // ✅ NEW
 const reportCardFormatRoutes = require('./routes/reportCardFormatRoutes'); // ✅ NEW
+const reportCardRoutes = require('./routes/reportCardRoutes'); // ✅ NEW
+
+
 
 
 
@@ -223,18 +226,7 @@ app.use('/class-co-scholastic-areas', classCoScholasticAreaRoutes); // ✅ NEW
 app.use('/coscholastic-evaluations', studentCoScholasticEvaluationRoutes); // ✅ NEW
 app.use('/student-remarks', studentRemarkRoutes); // ✅ Add this line
 app.use('/report-card-formats', reportCardFormatRoutes);
-
-
-
-
-
-
-
-
-
-
-
-
+app.use('/report-card', reportCardRoutes); 
 
 
 

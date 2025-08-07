@@ -38,7 +38,7 @@ module.exports = (sequelize, DataTypes) => {
   StudentCoScholasticEvaluation.associate = function (models) {
     StudentCoScholasticEvaluation.belongsTo(models.Student, { foreignKey: "student_id" });
     StudentCoScholasticEvaluation.belongsTo(models.CoScholasticArea, { foreignKey: "co_scholastic_area_id" });
-    StudentCoScholasticEvaluation.belongsTo(models.GradeScheme, { foreignKey: "grade_id" });
+    StudentCoScholasticEvaluation.belongsTo(models.CoScholasticGrade, { foreignKey: "grade_id" }); // ✅ FIXED
     StudentCoScholasticEvaluation.belongsTo(models.Term, { foreignKey: "term_id" });
     StudentCoScholasticEvaluation.belongsTo(models.Class, { foreignKey: "class_id" });
     StudentCoScholasticEvaluation.belongsTo(models.Section, { foreignKey: "section_id" });

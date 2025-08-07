@@ -22,5 +22,13 @@ module.exports = (sequelize, DataTypes) => {
     },
   });
 
+  // ✅ Add association to Student model
+  StudentRemark.associate = (models) => {
+    StudentRemark.belongsTo(models.Student, {
+      foreignKey: "student_id",
+      as: "student", // 👈 Make sure you use this alias in includes
+    });
+  };
+
   return StudentRemark;
 };
