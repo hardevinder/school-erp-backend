@@ -1,9 +1,11 @@
 const { Op } = require("sequelize");
 const {
+  sequelize,  
   Student,
   Subject,
   ExamSchedule,
   ExamScheme,
+  Exam,
   AssessmentComponent,
   StudentExamResult,
   GradeScheme,
@@ -20,6 +22,8 @@ const {
   ReportCardFormatClass, 
   ReportCardFormat
 } = require("../models");
+
+
 
 
 // ✅ GET /report-card/students
@@ -61,9 +65,8 @@ exports.getReportCardStudents = async (req, res) => {
         section_id,
         status: "enabled",
         visible: true,
-        ...(student_ids.length > 0 && {
-          id: { [Op.in]: student_ids },
-        }),
+        roll_number: { [Op.ne]: null },
+        ...(student_ids.length > 0 && { id: { [Op.in]: student_ids } }),
       },
       order: [["roll_number", "ASC"]],
       include: [
@@ -85,7 +88,7 @@ exports.getScholasticSummary = async (req, res) => {
     let {
       class_id,
       section_id,
-      exam_id,
+      exam_ids, // ✅ now expecting an array
       subjectComponents,
       grade_scheme_id,
       student_ids = [],
@@ -100,7 +103,9 @@ exports.getScholasticSummary = async (req, res) => {
       });
 
       if (!assigned) {
-        return res.status(400).json({ message: "Class/Section not provided and you're not an incharge." });
+        return res.status(400).json({
+          message: "Class/Section not provided and you're not an incharge.",
+        });
       }
 
       class_id = assigned.classId;
@@ -117,13 +122,21 @@ exports.getScholasticSummary = async (req, res) => {
     });
 
     if (!isIncharge) {
-      return res.status(403).json({ message: "You are not incharge of this class-section." });
+      return res.status(403).json({
+        message: "You are not incharge of this class-section.",
+      });
     }
 
+    // ✅ Validate exam_ids array
+    if (!Array.isArray(exam_ids) || exam_ids.length === 0) {
+      return res.status(400).json({ message: "exam_ids must be a non-empty array." });
+    }
+
+    // ✅ Call summary logic with exam_ids
     const data = await getScholasticSummaryForReportCard({
       class_id,
       section_id,
-      exam_id,
+      exam_ids, // ✅ pass array
       subjectComponents,
       gradeSchemeId: grade_scheme_id,
       student_ids,
@@ -136,195 +149,6 @@ exports.getScholasticSummary = async (req, res) => {
   }
 };
 
-// ✅ INTERNAL HELPER FUNCTION
-async function getScholasticSummaryForReportCard({
-  class_id,
-  section_id,
-  exam_id,
-  subjectComponents,
-  gradeSchemeId,
-  student_ids = [],
-}) {
-  if (!class_id || !section_id || !exam_id || !subjectComponents.length) {
-    throw new Error("Missing required fields for scholastic summary");
-  }
-
-  const students = await Student.findAll({
-    where: {
-      class_id,
-      section_id,
-      status: "enabled",
-      visible: true,
-      roll_number: { [Op.ne]: null },
-      ...(student_ids.length > 0 && { id: { [Op.in]: student_ids } }),
-    },
-    order: [["roll_number", "ASC"]],
-  });
-
- const gradeSchemes = await GradeScheme.findAll({
-  order: [["min_percent", "DESC"]],
-});
-
-
-
-  const allStudentData = [];
-  const subjectComponentGroups = [];
-  const componentMapBySubject = {};
-
-  for (const group of subjectComponents) {
-    const { subject_id, component_ids } = group;
-
-    const schedule = await ExamSchedule.findOne({
-      where: { class_id, section_id, exam_id, subject_id },
-    });
-    if (!schedule || !schedule.term_id) continue;
-
-    const subject = await Subject.findByPk(subject_id);
-    const schemeEntries = await ExamScheme.findAll({
-      where: { class_id, subject_id, term_id: schedule.term_id },
-      include: [{ model: AssessmentComponent, as: "component" }],
-      order: [["serial_order", "ASC"]],
-    });
-
-    const selectedComponents = component_ids?.length
-      ? schemeEntries.filter((e) => component_ids.includes(e.component_id))
-      : [];
-
-    componentMapBySubject[subject_id] = selectedComponents;
-
-    const groupTotalWeightage = selectedComponents.reduce(
-      (sum, c) => sum + (c.weightage_percent || 0),
-      0
-    );
-
-    subjectComponentGroups.push({
-      subject_id,
-      subject_name: subject.name,
-      total_weightage: groupTotalWeightage,
-      components: selectedComponents.map((c) => ({
-        component_id: c.component_id,
-        name: c.component.abbreviation || c.component.name,
-        weightage_percent: c.weightage_percent || 0,
-      })),
-    });
-
-    const results = await StudentExamResult.findAll({
-      where: { exam_schedule_id: schedule.id },
-    });
-
-    for (const student of students) {
-      let stuObj = allStudentData.find((s) => s.id === student.id);
-      if (!stuObj) {
-        stuObj = {
-          id: student.id,
-          name: student.name,
-          roll_number: student.roll_number,
-          components: [],
-          subject_totals_raw: {},
-          subject_totals_weighted: {},
-          subject_grades: {},
-          total_raw: 0,
-          total_weighted: 0,
-        };
-        allStudentData.push(stuObj);
-      }
-
-      let rawTotal = 0,
-        weightedTotal = 0;
-      for (const comp of selectedComponents) {
-        const resEntry =
-          results.find(
-            (r) =>
-              r.student_id === student.id &&
-              r.component_id === comp.component_id
-          ) || {};
-        const marks = resEntry.marks_obtained ?? null;
-        const attendance = resEntry.attendance || "P";
-        const weightage = comp.weightage_percent || 0;
-        const max = comp.component.max_marks || 100;
-
-        const weighted_marks =
-          marks != null && attendance === "P"
-            ? parseFloat(((marks / max) * weightage).toFixed(2))
-            : null;
-
-        rawTotal += marks != null && attendance === "P" ? marks : 0;
-        weightedTotal += weighted_marks != null ? weighted_marks : 0;
-
-        stuObj.components.push({
-          component_id: comp.component_id,
-          subject_id,
-          name: `${comp.component.abbreviation || comp.component.name}`,
-          marks,
-          weighted_marks,
-          attendance,
-          weightage_percent: weightage,
-          grade: marks != null && attendance === "P"
-            ? getGrade((marks / max) * 100, gradeSchemes)
-            : null,
-          weighted_grade: weighted_marks != null
-            ? getGrade((weighted_marks / weightage) * 100, gradeSchemes)
-            : null,
-        });
-      }
-
-      if (selectedComponents.length > 0) {
-        stuObj.subject_totals_raw[subject_id] = rawTotal;
-        stuObj.subject_totals_weighted[subject_id] = weightedTotal;
-        const maxRaw = selectedComponents.reduce(
-          (acc, c) => acc + (c.component.max_marks || 100),
-          0
-        );
-        const grade =
-          maxRaw > 0 ? getGrade((rawTotal / maxRaw) * 100, gradeSchemes) : null;
-        stuObj.subject_grades[subject_id] = grade;
-      }
-    }
-  }
-
-  for (const stu of allStudentData) {
-    let sumRaw = 0,
-      sumWeighted = 0;
-    let maxRaw = 0,
-      maxWeight = 0;
-
-    for (const sid of subjectComponents.map((sc) => parseInt(sc.subject_id))) {
-      const comps = componentMapBySubject[sid] || [];
-      sumRaw += stu.subject_totals_raw[sid] || 0;
-      sumWeighted += stu.subject_totals_weighted[sid] || 0;
-      for (const c of comps) {
-        maxRaw += c.component.max_marks || 100;
-        maxWeight += c.weightage_percent || 0;
-      }
-    }
-
-    stu.total_raw = sumRaw;
-    stu.total_weighted = sumWeighted;
-
-    stu.total_grade_raw =
-      maxRaw > 0 ? getGrade((sumRaw / maxRaw) * 100, gradeSchemes) : null;
-    stu.total_grade_weighted =
-      maxWeight > 0 ? getGrade((sumWeighted / maxWeight) * 100, gradeSchemes) : null;
-  }
-
-  return {
-    students: allStudentData,
-    subjectComponentGroups,
-  };
-}
-
-// ✅ Grade Mapping Helper
-function getGrade(percent, gradeSchemes) {
-  const rounded = Math.round(percent * 1000) / 1000;
-  for (const scheme of gradeSchemes) {
-    const min = parseFloat(scheme.min_percent);
-    const max = parseFloat(scheme.max_percent);
-    if (rounded >= min && rounded <= max) {
-      return scheme.grade;
-    }
-  }
-  return null;
-}
 
 
 // ✅ Get Co-Scholastic Grades per Student
@@ -580,3 +404,541 @@ const getFormatForClass = async (class_id) => {
 
 // ✅ Optional: Export utility if needed elsewhere
 exports.getFormatForClass = getFormatForClass;
+
+
+
+// ==========================================
+// ✅ Get Detailed Summary Report for Multiple Exams (Component + Total)
+// ==========================================
+exports.getMultiExamReportSummary = async (req, res) => {
+  try {
+    const {
+      class_id,
+      section_id,
+      exam_ids = [],
+      subjectComponents = [],
+      sum,
+      showSubjectTotals,
+      includeGrades,
+    } = req.body;
+
+    if (
+      !class_id ||
+      !section_id ||
+      !Array.isArray(exam_ids) ||
+      exam_ids.length === 0 ||
+      subjectComponents.length === 0
+    ) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    const includeGradesBool =
+      includeGrades === true || includeGrades === "true";
+
+    const students = await Student.findAll({
+      where: {
+        class_id,
+        section_id,
+        status: "enabled",
+        visible: true,
+        roll_number: { [Op.ne]: null },
+      },
+      order: [["roll_number", "ASC"]],
+    });
+
+    const gradeSchemes = await GradeScheme.findAll({
+      order: [["min_percent", "DESC"]],
+    });
+
+    const exams = await Exam.findAll({ where: { id: exam_ids } });
+    const examMap = Object.fromEntries(exams.map((e) => [e.id, e.name]));
+
+    const allStudentData = [];
+    const summary = {
+      components: {},
+      total: getEmptyBuckets(),
+    };
+    const subjectComponentGroups = [];
+    const componentMapBySubject = {};
+
+    for (const { subject_id, component_ids } of subjectComponents) {
+      const schedules = await ExamSchedule.findAll({
+        where: {
+          class_id,
+          section_id,
+          exam_id: exam_ids,
+          subject_id,
+        },
+      });
+      if (!schedules.length) continue;
+
+      const subject = await Subject.findByPk(subject_id);
+      const selectedComponentsPerExam = [];
+
+      for (const sched of schedules) {
+        const schemeEntries = await ExamScheme.findAll({
+          where: {
+            class_id,
+            subject_id,
+            term_id: sched.term_id,
+          },
+          include: [{ model: AssessmentComponent, as: "component" }],
+        });
+
+        const selectedComponents = component_ids.length
+          ? schemeEntries.filter((e) =>
+              component_ids.includes(e.component_id)
+            )
+          : schemeEntries;
+
+        for (const comp of selectedComponents) {
+          selectedComponentsPerExam.push({
+            schedule_id: sched.id,
+            exam_id: sched.exam_id,
+            exam_name: examMap[sched.exam_id] || "",
+            component_id: comp.component_id,
+            component: comp.component,
+            weightage_percent: comp.weightage_percent || 0,
+          });
+
+          const key = `${comp.component.abbreviation || comp.component.name} (${subject.name})`;
+          summary.components[key] = getEmptyBuckets(comp.component.max_marks);
+        }
+      }
+
+      if (!selectedComponentsPerExam.length) continue;
+      componentMapBySubject[subject_id] = selectedComponentsPerExam;
+
+      const total_weightage = selectedComponentsPerExam.reduce(
+        (sum, c) => sum + c.weightage_percent,
+        0
+      );
+
+      subjectComponentGroups.push({
+        subject_id,
+        subject_name: subject.name,
+        total_weightage,
+        components: selectedComponentsPerExam.map((c) => ({
+          component_id: c.component_id,
+          name: c.component.abbreviation || c.component.name,
+          weightage_percent: c.weightage_percent,
+          exam_id: c.exam_id,
+          exam_name: c.exam_name,
+        })),
+      });
+
+      const scheduleIds = selectedComponentsPerExam.map((c) => c.schedule_id);
+      const allResults = await StudentExamResult.findAll({
+        where: { exam_schedule_id: scheduleIds },
+      });
+
+      for (const student of students) {
+        let stuObj = allStudentData.find((s) => s.id === student.id);
+        if (!stuObj) {
+          stuObj = {
+            id: student.id,
+            name: student.name,
+            roll_number: student.roll_number,
+            components: [],
+            subject_totals_raw: {},
+            subject_totals_weighted: {},
+            subject_grades: {},
+            total_raw: 0,
+            total_weighted: 0,
+          };
+          allStudentData.push(stuObj);
+        }
+
+        let rawTotal = 0,
+          weightedTotal = 0;
+
+        for (const comp of selectedComponentsPerExam) {
+          const resEntry =
+            allResults.find(
+              (r) =>
+                r.student_id === student.id &&
+                r.component_id === comp.component_id &&
+                r.exam_schedule_id === comp.schedule_id
+            ) || {};
+
+          const marks = resEntry.marks_obtained ?? null;
+          const attendance = resEntry.attendance || "P";
+          const weightage = comp.weightage_percent;
+          const max = comp.component.max_marks || 100;
+          const key = `${comp.component.abbreviation || comp.component.name} (${subject.name})`;
+
+          const weighted_marks =
+            marks != null && attendance === "P"
+              ? parseFloat(((marks / max) * weightage).toFixed(2))
+              : null;
+
+          const percent =
+            marks != null && attendance === "P" ? (marks / max) * 100 : null;
+
+          if (percent != null) {
+            const bucket = getBucket(percent);
+            summary.components[key][bucket]++;
+          }
+
+          if (marks != null && attendance === "P") {
+            rawTotal += marks;
+            weightedTotal += weighted_marks;
+          }
+
+          stuObj.components.push({
+            exam_id: comp.exam_id,
+            exam_name: comp.exam_name,
+            component_id: comp.component_id,
+            subject_id,
+            subject_name: subject.name,
+            name: key,
+            marks,
+            weighted_marks,
+            attendance,
+            weightage_percent: weightage,
+            grade: percent != null ? getGrade(percent, gradeSchemes) : null,
+            weighted_grade:
+              weighted_marks != null
+                ? getGrade((weighted_marks / weightage) * 100, gradeSchemes)
+                : null,
+          });
+        }
+
+        stuObj.subject_totals_raw[subject_id] = rawTotal;
+        stuObj.subject_totals_weighted[subject_id] = weightedTotal;
+
+        if (includeGradesBool) {
+          const maxRaw = selectedComponentsPerExam.reduce(
+            (acc, c) => acc + (c.component.max_marks || 100),
+            0
+          );
+          stuObj.subject_grades[subject_id] =
+            maxRaw > 0
+              ? getGrade((rawTotal / maxRaw) * 100, gradeSchemes)
+              : null;
+        }
+      }
+    }
+
+    // Compute grand totals
+    let grandRaw = 0,
+      grandRawMax = 0,
+      grandWeighted = 0,
+      grandWeightMax = 0;
+    const subjectIds = subjectComponents.map((sc) => parseInt(sc.subject_id, 10));
+
+    for (const stu of allStudentData) {
+      let sumRaw = 0,
+        sumWeighted = 0,
+        maxRaw = 0,
+        maxWeight = 0;
+
+      for (const sid of subjectIds) {
+        const comps = componentMapBySubject[sid] || [];
+        sumRaw += stu.subject_totals_raw[sid] || 0;
+        sumWeighted += stu.subject_totals_weighted[sid] || 0;
+        for (const c of comps) {
+          maxRaw += c.component.max_marks || 100;
+          maxWeight += c.weightage_percent || 0;
+        }
+      }
+
+      stu.total_raw = sumRaw;
+      stu.total_weighted = sumWeighted;
+      grandRaw += sumRaw;
+      grandRawMax += maxRaw;
+      grandWeighted += sumWeighted;
+      grandWeightMax += maxWeight;
+
+      if (includeGradesBool) {
+        stu.grand_percent_raw =
+          maxRaw > 0 ? parseFloat(((sumRaw / maxRaw) * 100).toFixed(2)) : null;
+        stu.grand_percent_weighted =
+          maxWeight > 0
+            ? parseFloat(((sumWeighted / maxWeight) * 100).toFixed(2))
+            : null;
+        stu.total_grade_raw =
+          maxRaw > 0 ? getGrade((sumRaw / maxRaw) * 100, gradeSchemes) : null;
+        stu.total_grade_weighted =
+          maxWeight > 0
+            ? getGrade((sumWeighted / maxWeight) * 100, gradeSchemes)
+            : null;
+      }
+
+      if (sum) {
+        const b = getBucket((sumWeighted / maxWeight) * 100);
+        summary.total[b]++;
+      }
+    }
+
+    const count = allStudentData.length;
+    summary.grand_total_raw =
+      count > 0 ? parseFloat((grandRaw / count).toFixed(2)) : 0;
+    summary.grand_total_weighted =
+      count > 0 ? parseFloat((grandWeighted / count).toFixed(2)) : 0;
+
+    if (includeGradesBool) {
+      const pr = grandRawMax > 0 ? (grandRaw / grandRawMax) * 100 : null;
+      const pw =
+        grandWeightMax > 0 ? (grandWeighted / grandWeightMax) * 100 : null;
+      summary.grand_percent_raw = pr != null ? parseFloat(pr.toFixed(2)) : null;
+      summary.grand_percent_weighted =
+        pw != null ? parseFloat(pw.toFixed(2)) : null;
+      summary.grand_total_grade_raw =
+        pr != null ? getGrade(pr, gradeSchemes) : null;
+      summary.grand_total_grade_weighted =
+        pw != null ? getGrade(pw, gradeSchemes) : null;
+    }
+
+    const total_weightage = subjectComponentGroups.reduce(
+      (sum, g) => sum + (g.total_weightage || 0),
+      0
+    );
+
+    return res.json({
+      students: allStudentData,
+      summary,
+      subjectComponentGroups,
+      total_weightage,
+    });
+  } catch (err) {
+    console.error("🔥 Error in getMultiExamReportSummary:", err);
+    res.status(500).json({ message: "Internal server error", error: err.message });
+  }
+};
+
+
+// — Helpers (unchanged) —
+function getBucket(percent) {
+  if (percent === 100) return "100";
+  else if (percent >= 90) return "90-99";
+  else if (percent >= 80) return "80-89";
+  else if (percent >= 70) return "70-79";
+  else if (percent >= 60) return "60-69";
+  else if (percent >= 50) return "50-59";
+  else return "0-49";
+}
+
+function getGrade(percent, gradeSchemes) {
+  const rounded = Math.round(percent * 1000) / 1000;
+  for (const scheme of gradeSchemes) {
+    const min = parseFloat(scheme.min_percent);
+    const max = parseFloat(scheme.max_percent);
+    if (rounded >= min && rounded <= max) {
+      return scheme.grade;
+    }
+  }
+  return null;
+}
+
+function getEmptyBuckets(max_marks = 100) {
+  return {
+    max_marks,
+    "100": 0,
+    "90-99": 0,
+    "80-89": 0,
+    "70-79": 0,
+    "60-69": 0,
+    "50-59": 0,
+    "0-49": 0,
+  };
+}
+
+
+// ✅ Helper to get grade from percent
+const getGradeFromPercent = (percent, gradeSchemes) => {
+  const rounded = Math.round(percent * 1000) / 1000;
+  for (const scheme of gradeSchemes) {
+    const min = Number(scheme.min_percent);
+    const max = Number(scheme.max_percent);
+    if (rounded >= min && rounded <= max) return scheme.grade;
+  }
+  return "-";
+};
+
+exports.generateFinalReportPDF = async (req, res) => {
+  try {
+    const {
+      html,
+      filters,
+      fileName = "FinalWeightedReport",
+      orientation = "portrait",
+    } = req.body;
+
+    const {
+      class_id,
+      section_id,
+      subject_components = [],
+      includeGrades = false,
+    } = filters || {};
+
+    if (!html || !class_id || !section_id || !subject_components.length) {
+      return res.status(400).json({ message: "Missing required data" });
+    }
+
+    const students = await Student.findAll({
+      where: {
+        class_id,
+        section_id,
+        status: "enabled",
+        visible: true,
+        roll_number: { [Op.ne]: null },
+      },
+      include: [
+        { model: Class, as: "Class", attributes: ["class_name"] },
+        { model: Section, as: "Section", attributes: ["section_name"] },
+      ],
+      order: [["roll_number", "ASC"]],
+    });
+
+    const gradeSchemes = includeGrades
+      ? await GradeScheme.findAll({ order: [["min_percent", "ASC"]] })
+      : [];
+
+    const allHeadersSet = new Set();
+    const studentScores = [];
+
+    for (const student of students) {
+      let grand_total = 0;
+      let total_weightage = 0;
+      const scores = {};
+
+      for (const { subject_id, term_component_map = {} } of subject_components) {
+        const subject = await Subject.findByPk(subject_id);
+        const subjectName = subject?.name || "Unknown";
+
+        let subject_total = 0;
+        let subject_weightage = 0;
+
+        for (const [term_id, component_ids] of Object.entries(term_component_map)) {
+          const scheduleIds = (
+            await ExamSchedule.findAll({
+              where: { class_id, section_id, subject_id, term_id },
+              attributes: ["id"],
+            })
+          ).map((s) => s.id);
+
+          if (scheduleIds.length && component_ids.length) {
+            const schemes = await ExamScheme.findAll({
+              where: {
+                class_id,
+                subject_id,
+                term_id,
+                component_id: { [Op.in]: component_ids },
+              },
+              include: [{ model: AssessmentComponent, as: "component" }],
+            });
+
+            for (const scheme of schemes) {
+              const comp = scheme.component;
+              const colKey = `${subjectName}-${comp.abbreviation || comp.name}`;
+              allHeadersSet.add(colKey);
+
+              const weightage = parseFloat(scheme.weightage_percent) || 0;
+              const max_marks = comp?.max_marks || 0;
+
+              const result = await StudentExamResult.findOne({
+                where: {
+                  student_id: student.id,
+                  component_id: scheme.component_id,
+                  attendance: "P",
+                  exam_schedule_id: { [Op.in]: scheduleIds },
+                },
+              });
+
+              const mo = result?.marks_obtained ?? null;
+              if (mo !== null && max_marks > 0) {
+                const weighted = (mo / max_marks) * weightage;
+                scores[colKey] = weighted.toFixed(2);
+                subject_total += weighted;
+              } else {
+                scores[colKey] = "-";
+              }
+
+              subject_weightage += weightage;
+            }
+          }
+        }
+
+        grand_total += subject_total;
+        total_weightage += subject_weightage;
+      }
+
+      const percentage =
+        total_weightage > 0 ? (grand_total / total_weightage) * 100 : 0;
+
+      const grade = includeGrades
+        ? getGradeFromPercent(percentage, gradeSchemes)
+        : "-";
+
+      studentScores.push({
+        roll_number: student.roll_number,
+        name: student.name,
+        class_section: `${student.Class?.class_name}-${student.Section?.section_name}`,
+        scores,
+        total: grand_total.toFixed(2),
+        grade,
+      });
+    }
+
+    const allHeaders = Array.from(allHeadersSet).sort();
+
+    // 🧾 Generate table HTML
+    let table = `<table border="1" cellspacing="0" cellpadding="5" width="100%" style="border-collapse: collapse; text-align:center">
+      <thead><tr>
+        <th>Roll No</th><th>Name</th><th>Class</th>`;
+    allHeaders.forEach((h) => (table += `<th>${h}</th>`));
+    table += `<th>Total</th><th>Grade</th></tr></thead><tbody>`;
+
+    studentScores.forEach((s) => {
+      table += `<tr>
+        <td>${s.roll_number}</td>
+        <td>${s.name}</td>
+        <td>${s.class_section}</td>`;
+      allHeaders.forEach((h) => {
+        table += `<td>${s.scores[h] || "-"}</td>`;
+      });
+      table += `<td>${s.total}</td><td>${s.grade}</td></tr>`;
+    });
+
+    table += `</tbody></table>`;
+
+    // 🧩 Fill template
+    const template = handlebars.compile(html);
+    const finalHtml = template({ table });
+
+    // 📄 File path
+    const filePath = path.join(
+      __dirname,
+      `../exports/${fileName}-${Date.now()}.pdf`
+    );
+
+    // 🧠 Puppeteer
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+    const page = await browser.newPage();
+    await page.setContent(finalHtml, { waitUntil: "networkidle0" });
+
+    await page.pdf({
+      path: filePath,
+      format: "A4",
+      landscape: orientation === "landscape",
+      printBackground: true,
+      margin: { top: "40px", bottom: "40px", left: "20px", right: "20px" },
+    });
+
+    await browser.close();
+
+    // 📦 Send and delete file
+    res.download(filePath, () => {
+      fs.unlinkSync(filePath);
+    });
+  } catch (error) {
+    console.error("🔥 PDF generation error:", error);
+    res
+      .status(500)
+      .json({ message: "Failed to generate PDF", error: error.message });
+  }
+};

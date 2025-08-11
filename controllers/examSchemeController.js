@@ -391,6 +391,69 @@ exports.getTermWiseComponents = async (req, res) => {
 };
 
 
+// NEW CONTROLLER for Report Card Generator
+exports.getComponentsByClassSectionExam = async (req, res) => {
+  const { class_id, section_id, exam_id } = req.query;
+
+  if (!class_id || !section_id || !exam_id) {
+    return res.status(400).json({ message: "Missing required parameters" });
+  }
+
+  try {
+    // Get the exam to extract term_id
+    const exam = await sequelize.models.Exam.findByPk(exam_id);
+    if (!exam) {
+      return res.status(404).json({ message: "Exam not found" });
+    }
+
+    const term_id = exam.term_id;
+
+    // Fetch all subjects that have components for this class & term
+    const schemes = await ExamScheme.findAll({
+      where: { class_id, term_id },
+      include: [
+        {
+          model: sequelize.models.Subject,
+          as: "subject",
+          attributes: ["id", "name"],
+        },
+        {
+          model: sequelize.models.AssessmentComponent,
+          as: "component",
+          attributes: ["id", "name", "abbreviation"],
+        },
+      ],
+      order: [["serial_order", "ASC"]],
+    });
+
+    // Group components by subject
+    const grouped = {};
+    for (const s of schemes) {
+      const subId = s.subject?.id;
+      if (!grouped[subId]) {
+        grouped[subId] = {
+          subject_id: subId,
+          subject_name: s.subject?.name,
+          components: [],
+        };
+      }
+
+      grouped[subId].components.push({
+        id: s.component?.id,
+        name: s.component?.name,
+        abbreviation: s.component?.abbreviation,
+        component_id: s.component_id,
+      });
+    }
+
+    res.json(Object.values(grouped));
+  } catch (error) {
+    console.error("🔥 Error in getComponentsByClassSectionExam:", error);
+    res.status(500).json({ message: "Internal server error", error: error.message });
+  }
+};
+
+
 
 
 

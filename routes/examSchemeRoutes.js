@@ -32,6 +32,15 @@ router.get(
 );
 
 // ==============================
+// ✅ NEW: Get Components Grouped by Subject for Class + Section + Exam
+// ==============================
+router.get(
+  "/components-by-class",
+  authenticateUser,
+  examSchemeController.getComponentsByClassSectionExam
+);
+
+// ==============================
 // ✅ Lock/Unlock individual Exam Scheme Component
 // ==============================
 router.patch(
@@ -46,6 +55,5 @@ router.get(
   authenticateUser,
   examSchemeController.getTermWiseComponents
 );
-
 
 module.exports = router;
