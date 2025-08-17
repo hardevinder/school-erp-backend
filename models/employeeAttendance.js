@@ -8,18 +8,21 @@ module.exports = (sequelize, DataTypes) => {
         autoIncrement: true,
         primaryKey: true,
       },
+
       employee_id: {
         type: DataTypes.INTEGER,
         allowNull: false,
         references: {
-          model: "employees", // Sequelize will match table name 'employees'
+          model: "employees", // table name
           key: "id",
         },
       },
+
       date: {
         type: DataTypes.DATEONLY,
         allowNull: false,
       },
+
       status: {
         type: DataTypes.ENUM(
           "present",
@@ -33,8 +36,19 @@ module.exports = (sequelize, DataTypes) => {
         ),
         allowNull: false,
       },
+
       remarks: {
         type: DataTypes.STRING,
+        allowNull: true,
+      },
+
+      // NEW: optional punch times (use TIME; switch to DATETIME if you have overnight shifts)
+      in_time: {
+        type: DataTypes.TIME,
+        allowNull: true,
+      },
+      out_time: {
+        type: DataTypes.TIME,
         allowNull: true,
       },
     },
@@ -44,17 +58,17 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         {
           unique: true,
-          fields: ["employee_id", "date"], // Ensures one attendance per day
+          fields: ["employee_id", "date"], // one attendance per day per employee
         },
       ],
     }
   );
 
-  // ✅ Define association for Employee -> EmployeeAttendance
+  // Association: EmployeeAttendance -> Employee
   EmployeeAttendance.associate = (models) => {
     EmployeeAttendance.belongsTo(models.Employee, {
       foreignKey: "employee_id",
-      as: "employee", // MUST match the `as` used in controller includes
+      as: "employee",
     });
   };
 

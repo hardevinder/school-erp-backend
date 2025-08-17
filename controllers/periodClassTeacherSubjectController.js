@@ -1,4 +1,15 @@
-const { PeriodClassTeacherSubject, User, Class, Period, Subject, Student, Substitution } = require('../models');
+// controllers/periodClassTeacherSubjectController.js
+const {
+  PeriodClassTeacherSubject,
+  User,
+  Class,
+  Period,
+  Subject,
+  Student,
+  Substitution,
+  Employee,
+  Role,
+} = require('../models');
 const { Op } = require("sequelize");
 
 // Create or update a record based on periodId, classId, and day.
@@ -24,15 +35,13 @@ exports.createRecord = async (req, res) => {
       teacherId_5,
       subjectId_5
     } = req.body;
-    // Compute combinationId as "classId_day_periodId"
+
     const combinationId = `${classId}_${day}_${periodId}`;
     
-    // Search for an existing record with the same periodId, classId, and day.
     const existingRecord = await PeriodClassTeacherSubject.findOne({
       where: { periodId, classId, day }
     });
     
-    // Use null for extra fields if they are not provided.
     const extras = {
       teacherId_2: teacherId_2 || null,
       subjectId_2: subjectId_2 || null,
@@ -45,12 +54,10 @@ exports.createRecord = async (req, res) => {
     };
     
     if (existingRecord) {
-      // Normalize the effectFrom values for a proper comparison.
       const existingEffectFrom = existingRecord.effectFrom ? new Date(existingRecord.effectFrom).toISOString() : null;
       const newEffectFrom = effectFrom ? new Date(effectFrom).toISOString() : null;
       
       if (existingEffectFrom === newEffectFrom) {
-        // If effectFrom is the same, update the existing record.
         await existingRecord.update({ 
           teacherId, 
           subjectId, 
@@ -61,7 +68,6 @@ exports.createRecord = async (req, res) => {
         });
         return res.status(200).json(existingRecord);
       } else {
-        // If effectFrom is different, create a new record.
         const newRecord = await PeriodClassTeacherSubject.create({
           periodId,
           classId,
@@ -76,7 +82,6 @@ exports.createRecord = async (req, res) => {
         return res.status(201).json(newRecord);
       }
     } else {
-      // No record found, so create a new one.
       const newRecord = await PeriodClassTeacherSubject.create({
         periodId,
         classId,
@@ -109,7 +114,6 @@ exports.getAllRecords = async (req, res) => {
   }
 };
 
-
 // Get a single record by id
 exports.getRecordById = async (req, res) => {
   try {
@@ -126,7 +130,6 @@ exports.getRecordById = async (req, res) => {
 };
 
 // Update a record by id (without conflict checks)
-// Also updates the combinationId field.
 exports.updateRecord = async (req, res) => {
   try {
     const { id } = req.params;
@@ -147,10 +150,9 @@ exports.updateRecord = async (req, res) => {
       teacherId_5,
       subjectId_5
     } = req.body;
-    // Compute combinationId
+
     const combinationId = `${classId}_${day}_${periodId}`;
 
-    // Use null for extra fields if not provided.
     const extras = {
       teacherId_2: teacherId_2 || null,
       subjectId_2: subjectId_2 || null,
@@ -218,15 +220,12 @@ exports.getDetailsByClassId = async (req, res) => {
   }
 };
 
-
 exports.getDetailsByTeacherId = async (req, res) => {
   try {
     const { teacherId } = req.params;
     if (!teacherId) {
       return res.status(400).json({ error: "Teacher ID is required" });
     }
-    // Query for published records for any teacher column matching teacherId,
-    // ordered by effectFrom descending.
     const records = await PeriodClassTeacherSubject.findAll({
       where: {
         published: true,
@@ -242,13 +241,12 @@ exports.getDetailsByTeacherId = async (req, res) => {
       include: [
         { model: Class, as: 'Class', attributes: ['class_name'] },
         { model: Period, as: 'Period', attributes: ['period_name'] },
+        // NOTE: If you changed associations to Employee, update these includes accordingly.
         { model: User, as: 'Teacher', attributes: ['name'] },
-        { model: Subject, as: 'Subject', attributes: ['id', 'name', 'description'] } // New include for Subject
+        { model: Subject, as: 'Subject', attributes: ['id', 'name', 'description'] }
       ]
     });
 
-    // Filter to keep only the first record for each unique combination.
-    // Here, we assume combinationId uniquely identifies a group.
     const uniqueRecords = [];
     const seenCombinationIds = new Set();
     records.forEach(record => {
@@ -265,17 +263,13 @@ exports.getDetailsByTeacherId = async (req, res) => {
   }
 };
 
-
-
 exports.getLoggedInTeacherDetails = async (req, res) => {
   try {
-    // Assuming authentication middleware attaches the logged in user to req.user.
     const teacherId = req.user && req.user.id;
     if (!teacherId) {
       return res.status(401).json({ error: "Unauthorized: Teacher not authenticated." });
     }
 
-    // Fetch only published records and order by combinationId and descending effectFrom.
     const records = await PeriodClassTeacherSubject.findAll({
       where: {
         published: true,
@@ -294,6 +288,7 @@ exports.getLoggedInTeacherDetails = async (req, res) => {
       include: [
         { model: Class, as: 'Class', attributes: ['class_name'] },
         { model: Period, as: 'Period', attributes: ['period_name'] },
+        // Update to Employee includes if associations were changed:
         { model: User, as: 'Teacher', attributes: ['name'] },
         { model: Subject, as: 'Subject', attributes: ['name'] },
         { model: User, as: 'Teacher2', attributes: ['name'] },
@@ -307,7 +302,6 @@ exports.getLoggedInTeacherDetails = async (req, res) => {
       ]
     });
 
-    // Group by combinationId: because of the ordering, the first record per group is the latest.
     const grouped = {};
     records.forEach(record => {
       const key = record.combinationId;
@@ -324,29 +318,22 @@ exports.getLoggedInTeacherDetails = async (req, res) => {
   }
 };
 
-
 // Student Time Table
-
 exports.getStudentTimetable = async (req, res) => {
   try {
-    // Get the student's identifier from the authenticated token.
     const admissionNumber = req.user.username;
-    
-    // Find the student record by the unique admission number.
     const student = await Student.findOne({ where: { admission_number: admissionNumber } });
     if (!student) {
       return res.status(404).json({ error: "Student not found" });
     }
-    
-    // Extract the class ID from the student's record.
     const classId = student.class_id;
     
-    // Fetch the timetable for the student's class where published is true.
     const timetableRecords = await PeriodClassTeacherSubject.findAll({
       where: { classId, published: true },
       include: [
         { model: Class, as: 'Class', attributes: ['class_name'] },
         { model: Period, as: 'Period', attributes: ['period_name'] },
+        // If you migrated associations to Employee, change these includes:
         { model: User, as: 'Teacher', attributes: ['name'] },
         { model: Subject, as: 'Subject', attributes: ['name'] },
         { model: User, as: 'Teacher2', attributes: ['name'] },
@@ -364,21 +351,17 @@ exports.getStudentTimetable = async (req, res) => {
       ]
     });
     
-    // Group records by combinationId and keep only the record with the latest effectFrom date.
     const latestRecordsMap = {};
     timetableRecords.forEach(record => {
       const key = record.combinationId;
-      // Convert effectFrom to a Date; if missing, treat as very old.
       const currentEffectDate = record.effectFrom ? new Date(record.effectFrom) : new Date(0);
       if (!latestRecordsMap[key] || currentEffectDate > new Date(latestRecordsMap[key].effectFrom)) {
         latestRecordsMap[key] = record;
       }
     });
     
-    // Convert the grouped records to an array.
     let result = Object.values(latestRecordsMap);
     
-    // Optional: Sort the results by day (using a custom day order) and then by periodId.
     const dayOrder = { Monday: 1, Tuesday: 2, Wednesday: 3, Thursday: 4, Friday: 5, Saturday: 6, Sunday: 7 };
     result.sort((a, b) => {
       if (a.day === b.day) {
@@ -394,8 +377,6 @@ exports.getStudentTimetable = async (req, res) => {
   }
 };
 
-
-
 exports.getTeacherWorkload = async (req, res) => {
   try {
     const { teacherId } = req.params;
@@ -403,7 +384,6 @@ exports.getTeacherWorkload = async (req, res) => {
       return res.status(400).json({ error: "Teacher ID is required" });
     }
 
-    // Fetch all published records for this teacher, ordered by effectFrom (latest first)
     const records = await PeriodClassTeacherSubject.findAll({
       where: {
         published: true,
@@ -418,7 +398,6 @@ exports.getTeacherWorkload = async (req, res) => {
       order: [['effectFrom', 'DESC']]
     });
 
-    // Group records by combinationId so that only the first (latest) record is kept per group.
     const uniqueRecords = {};
     records.forEach(record => {
       const key = record.combinationId;
@@ -428,21 +407,16 @@ exports.getTeacherWorkload = async (req, res) => {
     });
     const uniqueArr = Object.values(uniqueRecords);
 
-    // (Optional) Ensure the unique records are in descending order by effectFrom
     uniqueArr.sort((a, b) => new Date(b.effectFrom) - new Date(a.effectFrom));
 
-    // Weekly workload is the count of unique records.
     const weeklyWorkload = uniqueArr.length;
 
-    // Daily workload: count unique records per day.
     const dailyWorkload = {};
     uniqueArr.forEach(record => {
       const day = record.day;
       dailyWorkload[day] = (dailyWorkload[day] || 0) + 1;
     });
 
-    // Sort daily workload entries in ascending order by count.
-    // For example, if Monday has 2 records and Tuesday has 5, Monday will come first.
     const sortedDailyWorkload = Object.entries(dailyWorkload)
       .sort(([, countA], [, countB]) => countA - countB)
       .reduce((acc, [day, count]) => {
@@ -457,73 +431,112 @@ exports.getTeacherWorkload = async (req, res) => {
   }
 };
 
+/**
+ * Availability endpoints updated to use Employee (with role 'teacher')
+ *
+ * IMPORTANT ID NOTE:
+ * - If PeriodClassTeacherSubject.teacherId stores EMPLOYEE IDs (recommended), leave as-is.
+ * - If it stores USER IDs, compare busy IDs to e.userAccount.id instead (see comments below).
+ */
+// controllers/... 
+// Assumes: const { PeriodClassTeacherSubject, Employee, User, Role } = require('../models');
 
+// Assumes: const models = require('../models');
+// and you call models.Employee.findAll below
 
 exports.getTeacherAvailability = async (req, res) => {
   try {
-    const { day, periodId } = req.query;
-    if (!day || !periodId) {
-      return res.status(400).json({ error: "Query parameters 'day' and 'periodId' are required." });
+    let { day, date, periodId } = req.query;
+
+    // ---- sanity checks on associations (better error than Sequelize's generic one) ----
+    if (!models.Employee?.associations?.userAccount) {
+      throw new Error("Association missing: Employee.associations.userAccount. Define Employee.belongsTo(User, { as: 'userAccount', foreignKey: 'user_id' })");
     }
-    
-    // Convert periodId to number for consistency
+    if (!models.User?.associations?.roles) {
+      throw new Error("Association missing: User.associations.roles. Define User.belongsToMany(Role, { through: 'UserRoles', as: 'roles', foreignKey: 'userId', otherKey: 'roleId' })");
+    }
+
+    // ---- validate inputs ----
+    if (!periodId) return res.status(400).json({ error: "Query parameter 'periodId' is required." });
     const numericPeriodId = Number(periodId);
-    console.log("Searching availability for day:", day, "and periodId:", numericPeriodId);
+    if (!Number.isInteger(numericPeriodId) || numericPeriodId <= 0) {
+      return res.status(400).json({ error: "Invalid 'periodId'." });
+    }
 
-    // Fetch all published records for the given day and period, ordered by effectFrom descending.
-    const records = await PeriodClassTeacherSubject.findAll({
-      where: {
-        day: day,
-        periodId: numericPeriodId,
-        published: true
-      },
-      order: [['effectFrom', 'DESC']]
+    if (!day && date) {
+      const d = new Date(date);
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ error: "Invalid 'date' (YYYY-MM-DD)." });
+      day = d.toLocaleDateString('en-US', { weekday: 'long' });
+    }
+    if (!day) return res.status(400).json({ error: "Provide either 'date' (YYYY-MM-DD) or 'day' (Monday..Saturday)." });
+
+    const VALID_DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+    const normDay = VALID_DAYS.find(v => v.toLowerCase() === String(day).toLowerCase());
+    if (!normDay) return res.status(400).json({ error: "Invalid 'day'. Expected Monday..Sunday." });
+
+    // ---- pull latest assignments per combinationId ----
+    const pct = models.PeriodClassTeacherSubject;
+    const records = await pct.findAll({
+      where: { day: normDay, periodId: numericPeriodId, published: true },
+      order: [['effectFrom', 'DESC']],
     });
 
-    console.log("Found", records.length, "records for day:", day, "and period:", numericPeriodId);
-
-    // Group records by combinationId so that only the latest record per group is considered.
-    const groupedRecords = {};
-    records.forEach(record => {
-      const key = record.combinationId;
-      if (!groupedRecords[key]) {
-        groupedRecords[key] = record;
+    const seen = new Set();
+    const uniqueRecords = [];
+    for (const rec of records) {
+      if (!seen.has(rec.combinationId)) {
+        seen.add(rec.combinationId);
+        uniqueRecords.push(rec);
       }
+    }
+
+    // busy EMPLOYEE ids (assuming teacherId* are Employee IDs)
+    const busy = new Set();
+    for (const r of uniqueRecords) {
+      if (r.teacherId)   busy.add(Number(r.teacherId));
+      if (r.teacherId_2) busy.add(Number(r.teacherId_2));
+      if (r.teacherId_3) busy.add(Number(r.teacherId_3));
+      if (r.teacherId_4) busy.add(Number(r.teacherId_4));
+      if (r.teacherId_5) busy.add(Number(r.teacherId_5));
+    }
+
+    // ---- main query using association refs (no string 'as') ----
+    const teacherEmployees = await models.Employee.findAll({
+      attributes: ['id', 'name', 'email'],
+      include: [
+        {
+          association: models.Employee.associations.userAccount,  // 'userAccount'
+          required: true,
+          attributes: ['id'],
+          include: [
+            {
+              association: models.User.associations.roles,        // 'roles'
+              required: true,
+              through: { attributes: [] },
+              where: { name: 'teacher' },
+              attributes: ['id', 'name'],
+            },
+          ],
+        },
+      ],
     });
-    const uniqueRecords = Object.values(groupedRecords);
 
-    // Extract busy teacher IDs from each unique record (convert to Number for consistency).
-    const busyTeacherIds = new Set();
-    uniqueRecords.forEach(record => {
-      if (record.teacherId) busyTeacherIds.add(Number(record.teacherId));
-      if (record.teacherId_2) busyTeacherIds.add(Number(record.teacherId_2));
-      if (record.teacherId_3) busyTeacherIds.add(Number(record.teacherId_3));
-      if (record.teacherId_4) busyTeacherIds.add(Number(record.teacherId_4));
-      if (record.teacherId_5) busyTeacherIds.add(Number(record.teacherId_5));
-    });
-
-    console.log("Busy teacher IDs:", Array.from(busyTeacherIds));
-
-    // Retrieve all teachers with role "teacher"
-    const allTeachers = await User.findAll({
-      where: { role: "teacher" },
-      attributes: ["id", "name", "email"]
-    });
-
-    // Filter out teachers that are busy.
-    const availableTeachers = allTeachers.filter(teacher => !busyTeacherIds.has(Number(teacher.id)));
+    const availableTeachers = teacherEmployees
+      .filter(e => !busy.has(Number(e.id)))
+      .map(e => ({
+        id: e.id,                             // EMPLOYEE id
+        name: e.name,
+        email: e.email,
+        user_id: e.userAccount?.id ?? null,   // user id as extra, if needed
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
 
     return res.status(200).json({ availableTeachers });
   } catch (error) {
     console.error("Error fetching teacher availability:", error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message || "Failed to fetch teacher availability." });
   }
 };
-
-
-// Example: controllers/teacherAvailabilityController.js
-
-
 
 exports.getTeacherAvailabilityForDate = async (req, res) => {
   try {
@@ -534,24 +547,17 @@ exports.getTeacherAvailabilityForDate = async (req, res) => {
     
     const numericPeriodId = Number(periodId);
     const inputDate = new Date(date);
-    
-    // Determine day (e.g., Monday, Tuesday) from the provided date.
-    const options = { weekday: 'long' };
-    const day = inputDate.toLocaleDateString('en-US', options);
-    
-    console.log("Searching availability for date:", date, "day:", day, "periodId:", numericPeriodId);
+    const day = inputDate.toLocaleDateString('en-US', { weekday: 'long' });
 
-    // 1. Fetch busy teacher IDs from published records in PeriodClassTeacherSubject.
     const records = await PeriodClassTeacherSubject.findAll({
       where: {
-        day: day,
+        day,
         periodId: numericPeriodId,
         published: true
       },
       order: [['effectFrom', 'DESC']]
     });
     
-    // Group records by combinationId to use only the latest record per group.
     const groupedRecords = {};
     records.forEach(record => {
       const key = record.combinationId;
@@ -570,29 +576,59 @@ exports.getTeacherAvailabilityForDate = async (req, res) => {
       if (record.teacherId_5) busyTeacherIds.add(Number(record.teacherId_5));
     });
 
-    // 2. Fetch substitutions for the given date, day and period.
     const substitutions = await Substitution.findAll({
       where: {
-        date: date,
-        day: day,
+        date,
+        day,
         periodId: numericPeriodId,
-        published: true  // Adjust if you want to consider only published substitutions
+        published: true
       }
     });
     substitutions.forEach(sub => {
       if (sub.teacherId) busyTeacherIds.add(Number(sub.teacherId));
     });
-    
-    console.log("Combined busy teacher IDs:", Array.from(busyTeacherIds));
 
-    // 3. Retrieve all teachers with role "teacher"
-    const allTeachers = await User.findAll({
-      where: { role: "teacher" },
-      attributes: ["id", "name", "email"]
+    // Pull teachers from Employee where linked User has role 'teacher'
+    const teacherEmployees = await Employee.findAll({
+      attributes: ['id', 'name', 'email'],
+      include: [
+        {
+          model: User,
+          as: 'userAccount',
+          required: true,
+          attributes: ['id'],
+          include: [
+            {
+              model: Role,
+              required: true,
+              through: { attributes: [] },
+              where: { name: 'teacher' },
+              attributes: ['id', 'name'],
+            },
+          ],
+        },
+      ],
     });
 
-    // Filter out teachers that are busy.
-    const availableTeachers = allTeachers.filter(teacher => !busyTeacherIds.has(Number(teacher.id)));
+    // If PeriodClassTeacherSubject.teacherId holds EMPLOYEE IDs (recommended):
+    let availableTeachers = teacherEmployees
+      .filter(e => !busyTeacherIds.has(Number(e.id)))
+      .map(e => ({
+        id: e.id,
+        name: e.name,
+        email: e.email,
+        user_id: e.userAccount?.id,
+      }));
+
+    // If instead PeriodClassTeacherSubject.teacherId stores USER IDs, switch to this:
+    // availableTeachers = teacherEmployees
+    //   .filter(e => !busyTeacherIds.has(Number(e.userAccount?.id)))
+    //   .map(e => ({
+    //     id: e.userAccount?.id,
+    //     name: e.name,
+    //     email: e.email,
+    //     employee_id: e.id,
+    //   }));
 
     return res.status(200).json({ availableTeachers });
   } catch (error) {

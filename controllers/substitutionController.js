@@ -1,60 +1,73 @@
-const { Substitution, User, Class, Subject, Student, Period } = require('../models');
+// controllers/substitutionController.js
+const { UniqueConstraintError } = require('sequelize');
+const { Substitution, Employee, User, Class, Subject, Student, Period } = require('../models');
 
-// Create or update a substitution
+/** Map the logged-in User to their Employee.id */
+async function getEmployeeIdFromReq(req) {
+  if (req.user?.employeeId) return req.user.employeeId;
+  const userId = req.user?.id;
+  if (!userId) return null;
+  const emp = await Employee.findOne({
+    where: { user_id: userId },
+    attributes: ['id'],
+    raw: true,
+  });
+  return emp?.id ?? null;
+}
+
+/** Create or update a substitution (teacherId & original_teacherId are EMPLOYEE IDs) */
 exports.createSubstitution = async (req, res) => {
   try {
     const { date, periodId, classId, teacherId, original_teacherId, subjectId, day, published } = req.body;
-    
-    // Check for an existing substitution with the same date, day, periodId, and classId.
-    const existingSubstitution = await Substitution.findOne({
-      where: { date, day, periodId, classId }
-    });
-    
+
+    const where = { date, day, periodId, classId };
+    const existing = await Substitution.findOne({ where });
+
     let substitution;
-    if (existingSubstitution) {
-      // If found, update the existing record.
-      substitution = await existingSubstitution.update({ teacherId, original_teacherId, subjectId, published });
+    if (existing) {
+      substitution = await existing.update({ teacherId, original_teacherId, subjectId, published });
       res.status(200).json(substitution);
     } else {
-      // Otherwise, create a new substitution record.
-      substitution = await Substitution.create({
-        date,
-        periodId,
-        classId,
-        teacherId,
-        original_teacherId,
-        subjectId,
-        day,
-        published
-      });
-      res.status(201).json(substitution);
+      try {
+        substitution = await Substitution.create({
+          date, periodId, classId, teacherId, original_teacherId, subjectId, day, published
+        });
+        res.status(201).json(substitution);
+      } catch (err) {
+        if (err instanceof UniqueConstraintError) {
+          const again = await Substitution.findOne({ where });
+          substitution = await again.update({ teacherId, original_teacherId, subjectId, published });
+          res.status(200).json(substitution);
+        } else {
+          throw err;
+        }
+      }
     }
-    
-    // Emit notification to the substitute teacher.
-    const io = req.app.get("socketio");
+
+    // Notifications
+    const io = req.app.get('socketio');
     if (io) {
-      // Fetch Period and Class details
-      const periodRecord = await Period.findByPk(periodId, { attributes: ['period_name'] });
-      const classRecord = await Class.findByPk(classId, { attributes: ['class_name'] });
-      const message = existingSubstitution 
+      const [periodRecord, classRecord] = await Promise.all([
+        Period.findByPk(periodId, { attributes: ['period_name'] }),
+        Class.findByPk(classId, { attributes: ['class_name'] })
+      ]);
+
+      const message = existing
         ? `Substitution updated for ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name}.`
         : `You have been assigned a substitution on ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name}.`;
+
       const payload = {
         substitutionId: substitution.id,
-        date,
-        periodId,
-        classId,
-        subjectId,
+        date, periodId, classId, subjectId,
         periodName: periodRecord?.period_name,
         className: classRecord?.class_name,
-        message
+        message,
       };
-      // For new substitution, emit "newSubstitution"; for updates, emit "substitutionUpdated".
-      const eventName = existingSubstitution ? "substitutionUpdated" : "newSubstitution";
+
+      const eventName = existing ? 'substitutionUpdated' : 'newSubstitution';
       io.to(`teacher-${teacherId}`).emit(eventName, payload);
-      console.log(`Notification sent to room teacher-${teacherId} for event ${eventName}:`, payload);
+      console.log(`Notification sent to teacher-${teacherId} (${eventName})`, payload);
     }
-    
   } catch (error) {
     console.error('Error creating/updating substitution:', error);
     res.status(500).json({ error: 'Failed to create/update substitution' });
@@ -65,48 +78,35 @@ exports.getAllSubstitutions = async (req, res) => {
   try {
     const substitutions = await Substitution.findAll({
       include: [
-        {
-          model: User,
-          as: 'Teacher', // Substitute teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: User,
-          as: 'OriginalTeacher', // Regular/original teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Period,
-          as: 'Period',
-          attributes: ['period_name']
-        }
-      ]
+        { model: Employee, as: 'Teacher',          attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher',  attributes: ['id', 'name', 'email'] },
+        { model: Subject,  as: 'Subject',          attributes: ['id', 'name'] },
+        { model: Class,    as: 'Class',            attributes: ['class_name'] },
+        { model: Period,   as: 'Period',           attributes: ['period_name'] }
+      ],
+      order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
-    res.status(200).json(substitutions);
+    return res.status(200).json(substitutions);
   } catch (error) {
-    console.error('Error retrieving substitutions:', error);
-    res.status(500).json({ error: 'Failed to retrieve substitutions' });
+    console.error('getAllSubstitutions error:', error);
+    // TEMP: surface real error during debugging
+    return res.status(500).json({ error: error.message });
   }
 };
 
-// Retrieve a single substitution by id
 exports.getSubstitutionById = async (req, res) => {
   try {
     const { id } = req.params;
-    const substitution = await Substitution.findByPk(id);
-    if (!substitution) {
-      return res.status(404).json({ error: 'Substitution not found' });
-    }
+    const substitution = await Substitution.findByPk(id, {
+      include: [
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+      ]
+    });
+    if (!substitution) return res.status(404).json({ error: 'Substitution not found' });
     res.status(200).json(substitution);
   } catch (error) {
     console.error('Error retrieving substitution:', error);
@@ -114,48 +114,35 @@ exports.getSubstitutionById = async (req, res) => {
   }
 };
 
-// Update a substitution by id
 exports.updateSubstitution = async (req, res) => {
   try {
     const { id } = req.params;
     const { date, periodId, classId, teacherId, original_teacherId, subjectId, day, published } = req.body;
 
     const substitution = await Substitution.findByPk(id);
-    if (!substitution) {
-      return res.status(404).json({ error: 'Substitution not found' });
-    }
+    if (!substitution) return res.status(404).json({ error: 'Substitution not found' });
 
-    await substitution.update({
-      date,
-      periodId,
-      classId,
-      teacherId,
-      original_teacherId,
-      subjectId,
-      day,
-      published
-    });
-
+    await substitution.update({ date, periodId, classId, teacherId, original_teacherId, subjectId, day, published });
     res.status(200).json(substitution);
 
-    // Emit notification for substitution update.
-    const io = req.app.get("socketio");
+    // Notifications
+    const io = req.app.get('socketio');
     if (io) {
-      // Fetch updated Period and Class details.
-      const periodRecord = await Period.findByPk(periodId, { attributes: ['period_name'] });
-      const classRecord = await Class.findByPk(classId, { attributes: ['class_name'] });
+      const [periodRecord, classRecord] = await Promise.all([
+        Period.findByPk(periodId, { attributes: ['period_name'] }),
+        Class.findByPk(classId, { attributes: ['class_name'] })
+      ]);
+
       const payload = {
         substitutionId: substitution.id,
-        date,
-        periodId,
-        classId,
-        subjectId,
+        date, periodId, classId, subjectId,
         periodName: periodRecord?.period_name,
         className: classRecord?.class_name,
-        message: `Substitution updated for ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name}.`
+        message: `Substitution updated for ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name}.`,
       };
-      io.to(`teacher-${teacherId}`).emit("substitutionUpdated", payload);
-      console.log(`Notification sent to room teacher-${teacherId} for substitution update:`, payload);
+
+      io.to(`teacher-${teacherId}`).emit('substitutionUpdated', payload);
+      console.log(`Notification sent to teacher-${teacherId} (update)`, payload);
     }
   } catch (error) {
     console.error('Error updating substitution:', error);
@@ -163,38 +150,33 @@ exports.updateSubstitution = async (req, res) => {
   }
 };
 
-// Delete a substitution by id
 exports.deleteSubstitution = async (req, res) => {
   try {
     const { id } = req.params;
     const substitution = await Substitution.findByPk(id);
-    if (!substitution) {
-      return res.status(404).json({ error: 'Substitution not found' });
-    }
+    if (!substitution) return res.status(404).json({ error: 'Substitution not found' });
 
-    // Preserve substitution data for notification before deletion.
     const { teacherId, date, periodId, classId } = substitution;
-    // Fetch Period and Class details.
-    const periodRecord = await Period.findByPk(periodId, { attributes: ['period_name'] });
-    const classRecord = await Class.findByPk(classId, { attributes: ['class_name'] });
-    
+
+    const [periodRecord, classRecord] = await Promise.all([
+      Period.findByPk(periodId, { attributes: ['period_name'] }),
+      Class.findByPk(classId, { attributes: ['class_name'] })
+    ]);
+
     await substitution.destroy();
     res.status(200).json({ message: 'Substitution deleted successfully' });
 
-    // Emit notification for substitution deletion.
-    const io = req.app.get("socketio");
+    const io = req.app.get('socketio');
     if (io) {
       const payload = {
         substitutionId: id,
-        date,
-        periodId,
-        classId,
+        date, periodId, classId,
         periodName: periodRecord?.period_name,
         className: classRecord?.class_name,
-        message: `Substitution on ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name} has been removed.`
+        message: `Substitution on ${date} in period ${periodRecord?.period_name} and class ${classRecord?.class_name} has been removed.`,
       };
-      io.to(`teacher-${teacherId}`).emit("substitutionDeleted", payload);
-      console.log(`Notification sent to room teacher-${teacherId} for substitution deletion:`, payload);
+      io.to(`teacher-${teacherId}`).emit('substitutionDeleted', payload);
+      console.log(`Notification sent to teacher-${teacherId} (delete)`, payload);
     }
   } catch (error) {
     console.error('Error deleting substitution:', error);
@@ -202,34 +184,24 @@ exports.deleteSubstitution = async (req, res) => {
   }
 };
 
-// By Date
+/** GET /substitutions/by-date?date=YYYY-MM-DD [&published=true] */
 exports.getSubstitutionsByDate = async (req, res) => {
   try {
-    const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ error: 'Date query parameter is required' });
-    }
+    const { date, published } = req.query;
+    if (!date) return res.status(400).json({ error: 'Date query parameter is required' });
 
-    // Find substitutions that match the provided date, including the associated Teacher, Class, and Subject details.
+    const where = { date };
+    if (published === 'true') where.published = true;
+
     const substitutions = await Substitution.findAll({
-      where: { date },
+      where,
       include: [
-        {
-          model: User,
-          as: 'Teacher',
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class', // Make sure this alias matches the association defined in your Substitution model
-          attributes: ['class_name']
-        },
-        {
-          model: Subject,
-          as: 'Subject', // Likewise, ensure this alias matches your association
-          attributes: ['name']
-        }
-      ]
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Subject,  as: 'Subject',         attributes: ['name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+      ],
+      order: [['periodId', 'ASC']]
     });
 
     res.status(200).json(substitutions);
@@ -239,40 +211,27 @@ exports.getSubstitutionsByDate = async (req, res) => {
   }
 };
 
-// By Date for Original Teacher
+/** GET /substitutions/by-date/original?date=YYYY-MM-DD */
 exports.getSubstitutionsForOriginalTeacherByDate = async (req, res) => {
   try {
-    const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ error: 'Date query parameter is required' });
-    }
+    const { date, published } = req.query;
+    if (!date) return res.status(400).json({ error: 'Date query parameter is required' });
 
-    // Assuming req.user contains the logged in teacher's info.
-    const loggedInTeacherId = req.user.id;
+    const employeeId = await getEmployeeIdFromReq(req);
+    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Find substitutions where the date matches and the logged in teacher is the original teacher.
+    const where = { date, original_teacherId: employeeId };
+    if (published === 'true') where.published = true;
+
     const substitutions = await Substitution.findAll({
-      where: { 
-        date,
-        original_teacherId: loggedInTeacherId 
-      },
+      where,
       include: [
-        {
-          model: User,
-          as: 'Teacher',
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['name']
-        }
-      ]
+        { model: Employee, as: 'Teacher', attributes: ['id', 'name', 'email'] },
+        { model: Class,    as: 'Class',   attributes: ['class_name'] },
+        { model: Subject,  as: 'Subject', attributes: ['name'] },
+        { model: Period,   as: 'Period',  attributes: ['period_name'] },
+      ],
+      order: [['periodId', 'ASC']]
     });
 
     res.status(200).json(substitutions);
@@ -282,45 +241,28 @@ exports.getSubstitutionsForOriginalTeacherByDate = async (req, res) => {
   }
 };
 
-// By Date for Teacher (when teacherId matches logged in teacher)
+/** GET /substitutions/by-date/teacher?date=YYYY-MM-DD */
 exports.getSubstitutionsForTeacherByDate = async (req, res) => {
   try {
-    const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ error: 'Date query parameter is required' });
-    }
+    const { date, published } = req.query;
+    if (!date) return res.status(400).json({ error: 'Date query parameter is required' });
 
-    // Assuming req.user contains the logged in teacher's info.
-    const loggedInTeacherId = req.user.id;
+    const employeeId = await getEmployeeIdFromReq(req);
+    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Find substitutions where the date matches and the logged in teacher is the substitute (teacherId).
+    const where = { date, teacherId: employeeId };
+    if (published === 'true') where.published = true;
+
     const substitutions = await Substitution.findAll({
-      where: { 
-        date,
-        teacherId: loggedInTeacherId 
-      },
+      where,
       include: [
-        {
-          model: User,
-          as: 'Teacher',
-          attributes: ['id', 'name']
-        },
-        {
-          model: User,
-          as: 'OriginalTeacher', // This alias must match your association in the Substitution model.
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['name']
-        }
-      ]
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Subject,  as: 'Subject',         attributes: ['name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] },
+      ],
+      order: [['periodId', 'ASC']]
     });
 
     res.status(200).json(substitutions);
@@ -330,118 +272,57 @@ exports.getSubstitutionsForTeacherByDate = async (req, res) => {
   }
 };
 
-// Retrieves substitutions for a student based on their class and, optionally, a provided date.
+/** Student view: GET /substitutions/student[?date=YYYY-MM-DD] */
 exports.getStudentSubstitutions = async (req, res) => {
   try {
-    // Get the student's admission number from the authenticated token.
     const admissionNumber = req.user.username;
-
-    // Find the student record by the unique admission number.
     const student = await Student.findOne({ where: { admission_number: admissionNumber } });
-    if (!student) {
-      return res.status(404).json({ error: "Student not found" });
-    }
+    if (!student) return res.status(404).json({ error: 'Student not found' });
 
-    // Extract the class ID from the student's record.
     const classId = student.class_id;
+    const { date, published } = req.query;
 
-    // Optionally, filter substitutions by date if a date query parameter is provided.
-    const { date } = req.query;
-    const whereClause = { classId };
-    if (date) {
-      whereClause.date = date;
-    }
+    const where = { classId };
+    if (date) where.date = date;
+    if (published === 'true') where.published = true;
 
-    // Fetch the substitution records for the student's class.
     const substitutionRecords = await Substitution.findAll({
-      where: whereClause,
+      where,
       include: [
-        {
-          model: User,
-          as: 'Teacher', // The substitute teacher.
-          attributes: ['id', 'name']
-        },
-        {
-          model: User,
-          as: 'OriginalTeacher', // The teacher who is being substituted.
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['name']
-        }
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Subject,  as: 'Subject',         attributes: ['name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] },
       ],
-      order: [
-        ['date', 'ASC'],
-        ['periodId', 'ASC']
-      ]
+      order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
 
-    // Group records by combinationId and keep only the record with the latest effectFrom date.
-    const latestRecordsMap = {};
-    substitutionRecords.forEach(record => {
-      const key = record.combinationId;
-      // If effectFrom is missing, treat it as a very old date.
-      const currentEffectDate = record.effectFrom ? new Date(record.effectFrom) : new Date(0);
-      if (!latestRecordsMap[key] || currentEffectDate > new Date(latestRecordsMap[key].effectFrom)) {
-        latestRecordsMap[key] = record;
-      }
-    });
-
-    // Convert the grouped records map to an array.
-    const latestSubstitutions = Object.values(latestRecordsMap);
-
-    res.status(200).json(latestSubstitutions);
+    res.status(200).json(substitutionRecords);
   } catch (error) {
     console.error('Error retrieving substitutions for student:', error);
     res.status(500).json({ error: 'Failed to retrieve substitutions for student' });
   }
 };
 
-
-// Logged in Teachers's Information.
+/** Logged-in teacher: all their assigned substitutions */
 exports.getTeacherSubstitutions = async (req, res) => {
   try {
-    // Assuming your auth middleware sets req.user
-    const loggedInTeacherId = req.user.id;
-    
+    const employeeId = await getEmployeeIdFromReq(req);
+    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+
     const substitutions = await Substitution.findAll({
-      where: { teacherId: loggedInTeacherId }, // Only substitutions for the logged in teacher
+      where: { teacherId: employeeId },
       include: [
-        {
-          model: User,
-          as: 'Teacher', // Substitute teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: User,
-          as: 'OriginalTeacher', // Original teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Period,
-          as: 'Period',
-          attributes: ['period_name']
-        }
-      ]
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+      ],
+      order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
-    
+
     res.status(200).json(substitutions);
   } catch (error) {
     console.error('Error retrieving teacher substitutions:', error);
@@ -449,43 +330,24 @@ exports.getTeacherSubstitutions = async (req, res) => {
   }
 };
 
-// Teacher Substituted (Original Teacher View)
+/** Logged-in original teacher: where they were substituted */
 exports.getOriginalTeacherSubstitutions = async (req, res) => {
   try {
-    // Assuming your auth middleware sets req.user
-    const loggedInTeacherId = req.user.id;
-    
+    const employeeId = await getEmployeeIdFromReq(req);
+    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+
     const substitutions = await Substitution.findAll({
-      where: { original_teacherId: loggedInTeacherId }, // Only substitutions where logged in teacher is the original teacher
+      where: { original_teacherId: employeeId },
       include: [
-        {
-          model: User,
-          as: 'Teacher', // Substitute teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: User,
-          as: 'OriginalTeacher', // Original teacher
-          attributes: ['id', 'name']
-        },
-        {
-          model: Subject,
-          as: 'Subject',
-          attributes: ['id', 'name']
-        },
-        {
-          model: Class,
-          as: 'Class',
-          attributes: ['class_name']
-        },
-        {
-          model: Period,
-          as: 'Period',
-          attributes: ['period_name']
-        }
-      ]
+        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,    as: 'Class',           attributes: ['class_name'] },
+        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+      ],
+      order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
-    
+
     res.status(200).json(substitutions);
   } catch (error) {
     console.error('Error retrieving original teacher substitutions:', error);

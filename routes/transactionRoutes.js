@@ -51,4 +51,8 @@ router.patch("/:id/restore", ...authAdmin, ctrl.restoreTransaction);
 // Permanent delete (superadmin only)
 router.delete("/:id", ...authSuper, ctrl.deleteTransaction);
 
+
+// ------- Single transaction ops -------
+router.get("/:id", ...authAdmin, ctrl.getTransactionById);
+
 module.exports = router;
