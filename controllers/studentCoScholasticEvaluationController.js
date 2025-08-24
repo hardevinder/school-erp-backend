@@ -1,3 +1,4 @@
+// controllers/studentCoScholasticEvaluationController.js
 const {
   Student,
   CoScholasticArea,
@@ -11,34 +12,58 @@ const {
 } = require("../models");
 const { Op } = require("sequelize");
 const ExcelJS = require("exceljs");
-const fs = require("fs");
 
-// ✅ Get students & areas for evaluation entry
+/* ---------------------------------------
+   Helpers
+---------------------------------------- */
+const getReqUser = (req) => req.authUser || req.user || null;
+const getReqRoles = (user) =>
+  Array.isArray(user?.roles) ? user.roles.map((r) => r.slug || r) : [];
+
+/* =========================================================
+   GET: Students & Areas for Evaluation Entry
+   GET /co-scholastic/evaluations?class_id=&section_id=&term_id=
+========================================================= */
 exports.getEvaluations = async (req, res) => {
   try {
     const { class_id, section_id, term_id } = req.query;
-    const userId = req.user
-?.id;
-    const userRoles = (req.user
-?.roles || []).map((r) => r.slug);
+    const user = getReqUser(req);
+    const userId = user?.id;
+    const userRoles = getReqRoles(user);
 
     if (!userId) return res.status(401).json({ message: "Unauthorized" });
+    if (!class_id || !section_id || !term_id) {
+      return res
+        .status(400)
+        .json({ message: "class_id, section_id, and term_id are required" });
+    }
 
+    // If not admin/superadmin, ensure teacher is incharge of class-section
     if (!userRoles.includes("admin") && !userRoles.includes("superadmin")) {
       const isAssigned = await Incharge.findOne({
         where: { teacherId: userId, classId: class_id, sectionId: section_id },
       });
       if (!isAssigned) {
-        return res.status(403).json({ message: "Not authorized for this class-section." });
+        return res
+          .status(403)
+          .json({ message: "Not authorized for this class-section." });
       }
     }
 
     const students = await Student.findAll({
-      where: { class_id, section_id, status: "enabled", visible: true, roll_number: { [Op.ne]: null } },
+      where: {
+        class_id,
+        section_id,
+        status: "enabled",
+        visible: true,
+        roll_number: { [Op.ne]: null },
+      },
       order: [["roll_number", "ASC"]],
     });
 
-    const areas = await CoScholasticArea.findAll({ order: [["serial_order", "ASC"]] });
+    const areas = await CoScholasticArea.findAll({
+      order: [["serial_order", "ASC"]],
+    });
 
     const existing = await StudentCoScholasticEvaluation.findAll({
       where: { class_id, section_id, term_id },
@@ -47,18 +72,41 @@ exports.getEvaluations = async (req, res) => {
     res.json({ students, areas, existingEvaluations: existing });
   } catch (err) {
     console.error("🔥 Error in getEvaluations:", err);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ message: "Internal server error", error: err.message });
   }
 };
 
-// ✅ Save or update evaluations
+/* =========================================================
+   POST: Save or Update Evaluations (bulk upsert)
+   POST /co-scholastic/evaluations
+   { evaluations: [ { student_id, co_scholastic_area_id, grade_id, remarks, term_id, class_id, section_id } ] }
+========================================================= */
 exports.saveEvaluations = async (req, res) => {
   const { evaluations } = req.body;
-  const t = await sequelize.transaction();
+  if (!Array.isArray(evaluations) || evaluations.length === 0) {
+    return res.status(400).json({ message: "evaluations array is required" });
+  }
 
+  const t = await sequelize.transaction();
   try {
     for (const ev of evaluations) {
-      const { student_id, co_scholastic_area_id, grade_id, remarks, term_id, class_id, section_id } = ev;
+      const {
+        student_id,
+        co_scholastic_area_id,
+        grade_id,
+        remarks,
+        term_id,
+        class_id,
+        section_id,
+      } = ev;
+
+      if (!student_id || !co_scholastic_area_id || !term_id || !class_id || !section_id) {
+        await t.rollback();
+        return res.status(400).json({
+          message:
+            "Each evaluation must include student_id, co_scholastic_area_id, term_id, class_id, section_id",
+        });
+      }
 
       await StudentCoScholasticEvaluation.upsert(
         { student_id, co_scholastic_area_id, grade_id, remarks, term_id, class_id, section_id },
@@ -71,15 +119,25 @@ exports.saveEvaluations = async (req, res) => {
   } catch (err) {
     await t.rollback();
     console.error("🔥 Error in saveEvaluations:", err);
-    res.status(500).json({ message: "Failed to save evaluations" });
+    res.status(500).json({ message: "Failed to save evaluations", error: err.message });
   }
 };
-// ✅ Export evaluations Excel template (with grade dropdowns + freeze + protection)
+
+/* =========================================================
+   GET: Export Evaluations Excel Template
+   GET /co-scholastic/evaluations/export?class_id=&section_id=&term_id=
+========================================================= */
 exports.exportEvaluations = async (req, res) => {
   try {
     const { class_id, section_id, term_id } = req.query;
 
-    // ✅ Fetch students
+    if (!class_id || !section_id || !term_id) {
+      return res
+        .status(400)
+        .json({ message: "class_id, section_id, and term_id are required" });
+    }
+
+    // Students
     const students = await Student.findAll({
       where: {
         class_id,
@@ -91,64 +149,65 @@ exports.exportEvaluations = async (req, res) => {
       order: [["roll_number", "ASC"]],
     });
 
-    // ✅ Fetch areas
+    // Areas
     const areas = await CoScholasticArea.findAll({
       order: [["serial_order", "ASC"]],
     });
 
-    // ✅ Fetch existing evaluations
+    // Existing evaluations
     const existing = await StudentCoScholasticEvaluation.findAll({
       where: { class_id, section_id, term_id },
     });
 
-    // ✅ Fetch grades from CoScholasticGrade
-    const gradeMap = {};
+    // Grades
     const grades = await CoScholasticGrade.findAll({
       order: [["order", "ASC"]],
       where: { is_active: true },
     });
-    grades.forEach((g) => (gradeMap[g.id] = g.grade));
 
-    // ✅ Map existing evaluations
+    // gradeId -> "A/B/..."
+    const gradeIdToLabel = {};
+    grades.forEach((g) => (gradeIdToLabel[g.id] = g.grade));
+
+    // Map: "studentId_areaId" -> { grade, remarks }
     const evalMap = {};
     existing.forEach((e) => {
       evalMap[`${e.student_id}_${e.co_scholastic_area_id}`] = {
-        grade: gradeMap[e.grade_id] || "",
+        grade: gradeIdToLabel[e.grade_id] || "",
         remarks: e.remarks || "",
       };
     });
 
     const workbook = new ExcelJS.Workbook();
 
-    // ✅ Main sheet first
-    const sheet = workbook.addWorksheet("Co-Scholastic Entry");
-
-    // ✅ Hidden dropdown sheet
+    // Hidden dropdown sheet
     const gradeSheet = workbook.addWorksheet("GradeOptions", { state: "veryHidden" });
     grades.forEach((g, idx) => {
       gradeSheet.getCell(`A${idx + 1}`).value = g.grade;
     });
 
-    // ✅ Header row
+    // Main sheet
+    const sheet = workbook.addWorksheet("Co-Scholastic Entry");
+
+    // Header
     const header = ["Roll No", "Student Name"];
     areas.forEach((a) => {
       header.push(`${a.name} - Grade`, `${a.name} - Remarks`);
     });
     sheet.addRow(header);
-    // ✅ Set widths for all columns based on header length
-      sheet.columns.forEach((col, idx) => {
-        const headerText = header[idx] || "";
-        const minWidth = 15;
-        const buffer = 5;
-        col.width = Math.max(headerText.length + buffer, minWidth);
-      });
 
+    // Column widths based on header text
+    sheet.columns.forEach((col, idx) => {
+      const headerText = header[idx] || "";
+      const minWidth = 15;
+      const buffer = 5;
+      col.width = Math.max(headerText.length + buffer, minWidth);
+    });
 
-
-    // ✅ Freeze top row and first 2 columns
+    // Freeze top row & first 2 columns
     sheet.views = [{ state: "frozen", xSplit: 2, ySplit: 1 }];
 
-    // ✅ Data rows
+    // Rows
     students.forEach((s) => {
       const row = [s.roll_number, s.name];
       areas.forEach((a) => {
@@ -159,10 +218,10 @@ exports.exportEvaluations = async (req, res) => {
       sheet.addRow(row);
     });
 
-    // ✅ Apply dropdowns and unlock editable cells
+    // Data validation for grade cells + unlock grade & remarks
     const gradeRange = `GradeOptions!$A$1:$A$${grades.length}`;
     for (let rowIndex = 2; rowIndex <= students.length + 1; rowIndex++) {
-      let colIndex = 3;
+      let colIndex = 3; // first grade column
       for (let i = 0; i < areas.length; i++) {
         const cell = sheet.getCell(rowIndex, colIndex);
         const remarksCell = sheet.getCell(rowIndex, colIndex + 1);
@@ -177,7 +236,6 @@ exports.exportEvaluations = async (req, res) => {
           error: "Please select a grade from the dropdown",
         };
 
-        // ✅ Unlock grade and remark cells
         cell.protection = { locked: false };
         remarksCell.protection = { locked: false };
 
@@ -185,14 +243,14 @@ exports.exportEvaluations = async (req, res) => {
       }
     }
 
-    // ✅ Protect entire worksheet with unlocked grade/remarks
-    sheet.protect("coscholastic2025", {
+    // Protect sheet but allow unlocked cells to be edited
+    await sheet.protect("coscholastic2025", {
       selectLockedCells: true,
       selectUnlockedCells: true,
-      formatColumns: true, // ✅ allow resizing column widths
+      formatColumns: true,
     });
 
-    // ✅ Set response headers and send file
+    // Send file
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -210,27 +268,35 @@ exports.exportEvaluations = async (req, res) => {
   }
 };
 
-
-
-// ✅ Import evaluations from Excel
+/* =========================================================
+   POST: Import Evaluations from Excel
+   POST /co-scholastic/evaluations/import
+   multipart/form-data: { file, class_id, section_id, term_id }
+========================================================= */
 exports.importEvaluations = async (req, res) => {
   const file = req.file;
   const { class_id, section_id, term_id } = req.body;
+
   if (!file) return res.status(400).json({ message: "No file uploaded" });
+  if (!class_id || !section_id || !term_id) {
+    return res
+      .status(400)
+      .json({ message: "class_id, section_id, and term_id are required" });
+  }
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(file.path);
   const sheet = workbook.worksheets[0];
+  if (!sheet) return res.status(400).json({ message: "Uploaded file has no sheet" });
 
   const areas = await CoScholasticArea.findAll({ order: [["serial_order", "ASC"]] });
-  const gradeMap = {};
-  const grades = await CoScholasticGrade.findAll({
-  where: { is_active: true },
-    });
-    grades.forEach((g) => {
-      gradeMap[g.grade.toUpperCase()] = g.id;
-    });
 
+  // "A", "B" -> grade_id
+  const gradeLabelToId = {};
+  const grades = await CoScholasticGrade.findAll({ where: { is_active: true } });
+  grades.forEach((g) => {
+    if (g.grade) gradeLabelToId[g.grade.toUpperCase()] = g.id;
+  });
 
   const t = await sequelize.transaction();
   try {
@@ -239,16 +305,18 @@ exports.importEvaluations = async (req, res) => {
       const rollNo = row.getCell(1).value;
       if (!rollNo) continue;
 
-      const student = await Student.findOne({ where: { roll_number: rollNo, class_id, section_id } });
+      const student = await Student.findOne({
+        where: { roll_number: rollNo, class_id, section_id },
+      });
       if (!student) continue;
 
-      let col = 3;
+      let col = 3; // first grade column
       for (const area of areas) {
-        const gradeStr = row.getCell(col++).value?.toString().trim().toUpperCase() || "";
-        const remarks = row.getCell(col++).value?.toString().trim() || "";
+        const gradeStr = (row.getCell(col++).value ?? "").toString().trim().toUpperCase();
+        const remarks = (row.getCell(col++).value ?? "").toString().trim();
 
         if (!gradeStr) continue;
-        const grade_id = gradeMap[gradeStr];
+        const grade_id = gradeLabelToId[gradeStr];
         if (!grade_id) continue;
 
         await StudentCoScholasticEvaluation.upsert(
@@ -271,110 +339,115 @@ exports.importEvaluations = async (req, res) => {
   } catch (err) {
     await t.rollback();
     console.error("🔥 Error in importEvaluations:", err);
-    res.status(500).json({ message: "Failed to import evaluations" });
+    res.status(500).json({ message: "Failed to import evaluations", error: err.message });
   }
 };
 
-// ✅ Lock evaluations
+/* =========================================================
+   POST: Lock Evaluations (class-section-term)
+   POST /co-scholastic/evaluations/lock
+========================================================= */
 exports.lockEvaluations = async (req, res) => {
   const { class_id, section_id, term_id } = req.body;
   try {
+    if (!class_id || !section_id || !term_id) {
+      return res
+        .status(400)
+        .json({ message: "class_id, section_id, and term_id are required" });
+    }
+
     await StudentCoScholasticEvaluation.update(
       { locked: true },
-      {
-        where: { class_id, section_id, term_id },
-      }
+      { where: { class_id, section_id, term_id } }
     );
+
     res.json({ message: "Evaluations locked successfully" });
   } catch (err) {
     console.error("🔥 Error in lockEvaluations:", err);
-    res.status(500).json({ message: "Failed to lock evaluations" });
+    res.status(500).json({ message: "Failed to lock evaluations", error: err.message });
   }
 };
 
-// ✅ Assigned Classes with Co-Scholastic Mapping
+/* =========================================================
+   GET: Assigned Classes (class-section pairs) for a Teacher
+   GET /co-scholastic/assigned-classes
+========================================================= */
 exports.getAssignedClasses = async (req, res) => {
-  // console.log("🔍 req.user:", req.user);
-
   try {
-    const teacherId = req.user?.id;
+    const teacherId = getReqUser(req)?.id;
     if (!teacherId) return res.status(401).json({ message: "Unauthorized" });
 
-    // Step 1: Get class-section incharge assignments for this teacher
+    // All incharge assignments for this teacher
     const inchargeAssignments = await Incharge.findAll({
       where: { teacherId },
-      include: [
-        { model: Class },   // No alias required
-        { model: Section }, // No alias required
-      ],
+      include: [{ model: Class }, { model: Section }],
     });
 
-    // Step 2: Fetch all class_ids from ClassCoScholasticArea
+    // Only return classes that have co-scholastic mapping
     const classCoScholastic = await ClassCoScholasticArea.findAll({
       attributes: ["class_id"],
       group: ["class_id"],
       raw: true,
     });
+    const validClassIds = new Set(classCoScholastic.map((r) => r.class_id));
 
-    const validClassIds = new Set(classCoScholastic.map((item) => item.class_id));
-
-    // Step 3: Filter and return only valid class-section pairs
     const result = inchargeAssignments
-      .filter(entry => {
-        return (
-          entry.Class &&
-          entry.Section &&
-          validClassIds.has(entry.classId)
-        );
-      })
-      .map(entry => ({
+      .filter((entry) => entry.Class && entry.Section && validClassIds.has(entry.classId))
+      .map((entry) => ({
         class_id: entry.classId,
         section_id: entry.sectionId,
         class_name: entry.Class.class_name,
         section_name: entry.Section.section_name,
-        label: `${entry.Class.class_name} - ${entry.Section.section_name}`
+        label: `${entry.Class.class_name} - ${entry.Section.section_name}`,
       }));
 
     res.json(result);
   } catch (err) {
     console.error("🔥 Error in getAssignedClasses:", err);
-    res.status(500).json({ message: "Failed to fetch assigned classes" });
+    res.status(500).json({ message: "Failed to fetch assigned classes", error: err.message });
   }
 };
 
-
-// ✅ Get Co-Scholastic Areas for a class (and optional term)
+/* =========================================================
+   GET: Co-Scholastic Areas for a Class (optional term)
+   GET /class-co-scholastic-areas?class_id=&term_id=
+   ⚠️ Requires association: ClassCoScholasticArea.belongsTo(CoScholasticArea, { as: 'area', foreignKey: 'co_scholastic_area_id' })
+========================================================= */
 exports.getCoScholasticAreas = async (req, res) => {
   try {
     const { class_id, term_id } = req.query;
 
     if (!class_id) {
-      return res.status(400).json({ message: "class_id is required" });
+      return res
+        .status(400)
+        .json({ message: "class_id is required (e.g. ?class_id=6)" });
     }
 
-    const whereClause = { class_id };
-    if (term_id) whereClause.term_id = term_id;
+    // Build where clause. Keep term_id ONLY if that column exists in your schema.
+    const where = { class_id };
+    if (term_id) where.term_id = term_id;
 
     const mappings = await ClassCoScholasticArea.findAll({
-      where: whereClause,
+      where,
       include: [
         {
           model: CoScholasticArea,
-          as: "area",
+          as: "area", // must match the association alias
           attributes: ["id", "name", "serial_order"],
         },
       ],
       order: [[{ model: CoScholasticArea, as: "area" }, "serial_order", "ASC"]],
     });
 
-    const areas = mappings.map((m) => ({
-      id: m.area.id,
-      name: m.area.name,
-    }));
+    const areas = mappings
+      .filter((m) => m.area) // guard in case any mapping lacks related area
+      .map((m) => ({ id: m.area.id, name: m.area.name }));
 
     res.json(areas);
   } catch (err) {
     console.error("🔥 Error in getCoScholasticAreas:", err);
-    res.status(500).json({ message: "Failed to fetch co-scholastic areas" });
+    res
+      .status(500)
+      .json({ message: "Failed to fetch co-scholastic areas", error: err.message });
   }
 };

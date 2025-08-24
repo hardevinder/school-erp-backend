@@ -222,73 +222,80 @@ const transactionController = {
     }
   },
 
-  updateTransaction: async (req, res) => {
-    try {
-      const transaction = await Transaction.findByPk(req.params.id);
-      if (!transaction) {
-        return res.status(404).json({ success: false, message: 'Transaction not found' });
-      }
-      // Allow both admin & superadmin to cancel (regardless of who created it)
-        if (!['admin', 'superadmin'].includes(req.user.role)) {
-          return res.status(403).json({ success: false, message: 'Not allowed to cancel this transaction' });
+  // controllers/transactionController.js (only the updateTransaction method)
+
+updateTransaction: async (req, res) => {
+  try {
+    const transaction = await Transaction.findByPk(req.params.id);
+    if (!transaction) {
+      return res.status(404).json({ success: false, message: "Transaction not found" });
+    }
+
+    // If you want a defensive check here (even though router already authorizes):
+    const roles = (req.user?.roles || []).map(String);
+    const canManage = roles.includes("admin") || roles.includes("superadmin");
+    if (!canManage) {
+      return res.status(403).json({ success: false, message: "Not allowed to update this transaction" });
+    }
+
+    // Apply update
+    await transaction.update(req.body);
+
+    // Notify (reload to ensure fresh values if needed)
+    await transaction.reload();
+
+    const studentAdmission = transaction.AdmissionNumber || req.body.AdmissionNumber;
+    if (studentAdmission) {
+      const studentUser = await User.findOne({ where: { username: studentAdmission } });
+      if (studentUser) {
+        const feeHeadingRecord = transaction.Fee_Head
+          ? await FeeHeading.findByPk(transaction.Fee_Head)
+          : null;
+        const feeHeadingName = feeHeadingRecord ? feeHeadingRecord.fee_heading : "N/A";
+
+        // Socket notification
+        const io = req.app.get("socketio");
+        if (io) {
+          const notificationData = {
+            title: "Fee Payment Updated",
+            message: `Dear ${studentUser.name || "Student"}, your fee payment for ${feeHeadingName} has been updated. Amount Received: ${transaction.Fee_Recieved}.`,
+            transactionId: String(transaction.id),
+          };
+          io.to(String(studentAdmission)).emit("fee-notification", notificationData);
+          console.log("Socket notification sent on update to room:", studentAdmission);
+        } else {
+          console.warn("Socket.io instance not found in app locals.");
         }
 
-      // Update the transaction
-      await transaction.update(req.body);
-      
-      // Send notification on update
-      const studentAdmission = transaction.AdmissionNumber || req.body.AdmissionNumber;
-      if (studentAdmission) {
-        const studentUser = await User.findOne({ where: { username: studentAdmission } });
-        if (studentUser) {
-          const feeHeadingRecord = transaction.Fee_Head ? await FeeHeading.findByPk(transaction.Fee_Head) : null;
-          const feeHeadingName = feeHeadingRecord ? feeHeadingRecord.fee_heading : "N/A";
-          
-          const io = req.app.get('socketio');
-          if (io) {
-            const notificationData = {
+        // FCM push (if available)
+        if (studentUser.fcmToken) {
+          const pushMessage = {
+            token: studentUser.fcmToken,
+            notification: {
               title: "Fee Payment Updated",
-              message: `Dear ${studentUser.name}, your fee payment for ${feeHeadingName} has been updated. Amount Received: ${transaction.Fee_Recieved}.`,
-              transactionId: transaction.id,
-            };
-            io.to(studentAdmission.toString()).emit('fee-notification', notificationData);
-            console.log("Socket notification sent on update to room:", studentAdmission);
-          } else {
-            console.warn("Socket.io instance not found in app locals.");
-          }
-          if (studentUser.fcmToken) {
-            const pushMessage = {
-              token: studentUser.fcmToken,
-              notification: {
-                title: "Fee Payment Updated",
-                body: `Dear ${studentUser.name}, your fee payment for ${feeHeadingName} has been updated. Amount Received: ${transaction.Fee_Recieved}.`
-              },
-              data: {
-                transactionId: transaction.id.toString(),
-              },
-            };
-            admin.messaging().send(pushMessage)
-              .then(response => {
-                console.log("Push notification sent successfully:", response);
-              })
-              .catch(error => {
-                console.error("Error sending push notification:", error);
-              });
-          } else {
-            console.warn("No FCM token found for user:", studentAdmission);
-          }
+              body: `Dear ${studentUser.name || "Student"}, your fee payment for ${feeHeadingName} has been updated. Amount Received: ${transaction.Fee_Recieved}.`
+            },
+            data: { transactionId: String(transaction.id) },
+          };
+          admin.messaging().send(pushMessage)
+            .then(r => console.log("Push notification sent:", r))
+            .catch(e => console.error("Error sending push notification:", e));
         } else {
-          console.warn("Student user not found for username:", studentAdmission);
+          console.warn("No FCM token for user:", studentAdmission);
         }
       } else {
-        console.warn("AdmissionNumber not provided for update notification.");
+        console.warn("Student user not found for username:", studentAdmission);
       }
-      
-      return res.status(200).json({ success: true, data: transaction });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: error.message });
+    } else {
+      console.warn("AdmissionNumber not provided for update notification.");
     }
-  },
+
+    return res.status(200).json({ success: true, data: transaction });
+  } catch (error) {
+    console.error("updateTransaction error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+},
 
   createBulkTransactions: async (req, res) => {
     const t = await sequelize.transaction();
