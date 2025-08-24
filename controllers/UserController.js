@@ -4,11 +4,24 @@ const path = require("path");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Op } = require("sequelize");
-const { User, Role, Student, Class, Section, Employee, Department, sequelize } = require("../models");
-
+const {
+  User,
+  Role,
+  Student,
+  Class,
+  Section,
+  Employee,
+  Department,
+  sequelize,
+} = require("../models");
 
 /* ------------ helpers ------------- */
 const needEmail = (rolesArr = []) => rolesArr.some((r) => r && r !== "student");
+const isEmail = (s) => !!s && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+
+/* small helper to send validation arrays uniformly */
+const sendValidation = (res, errors, code = 400) =>
+  res.status(code).json({ success: false, message: "Validation failed", errors });
 
 /* =========================================================
    REGISTER
@@ -26,30 +39,39 @@ exports.registerUser = async (req, res) => {
       fcmToken,
       roles = [],
       role,
-      employee_internal_id, // ✅ actual employee table primary key
+      employee_internal_id, // employee table PK
     } = req.body;
 
-    if (!name || !username) {
-      await t.rollback();
-      return res.status(400).json({ error: "Name & username are required" });
+    const errors = [];
+    if (!name) errors.push({ field: "name", message: "Name is required." });
+    if (!username)
+      errors.push({ field: "username", message: "Username is required." });
+
+    const roleArr =
+      Array.isArray(roles) && roles.length > 0 ? roles : role ? [role] : [];
+    if (!roleArr.length)
+      errors.push({
+        field: "roles",
+        message: "At least one role must be assigned.",
+      });
+
+    // staff email requirement
+    if (needEmail(roleArr)) {
+      if (!email)
+        errors.push({
+          field: "email",
+          message: "Email is required for staff roles.",
+        });
+      else if (!isEmail(email))
+        errors.push({ field: "email", message: "Invalid email address." });
     }
 
-    // 🔍 Prepare final role array
-    const roleArr = Array.isArray(roles) && roles.length > 0 ? roles : role ? [role] : [];
-
-    if (roleArr.length === 0) {
+    if (errors.length) {
       await t.rollback();
-      return res.status(400).json({ error: "At least one role must be assigned" });
+      return sendValidation(res, errors);
     }
 
-    // ✅ Check for username uniqueness
-    const existingUsername = await User.findOne({ where: { username }, transaction: t });
-    if (existingUsername) {
-      await t.rollback();
-      return res.status(400).json({ error: "Username is already taken" });
-    }
-
-    // 🔐 Role creation permission
+    // Permission to assign requested roles
     const currentUserRoles = req.user?.roles || [];
     const isAdmin = currentUserRoles.includes("admin");
     const isSuperadmin = currentUserRoles.includes("superadmin");
@@ -64,37 +86,55 @@ exports.registerUser = async (req, res) => {
 
     if (invalidRoleRequested) {
       await t.rollback();
-      return res.status(403).json({ error: "You are not allowed to assign one or more of the requested roles." });
+      return res.status(403).json({
+        success: false,
+        message: "You are not allowed to assign one or more of the requested roles.",
+      });
     }
 
-    // 📧 Email validation
-    if (needEmail(roleArr)) {
-      if (!email) {
-        await t.rollback();
-        return res.status(400).json({ error: "Email is required for staff roles" });
-      }
-      const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-      if (!emailRegex.test(email)) {
-        await t.rollback();
-        return res.status(400).json({ error: "Please provide a valid email address" });
-      }
-      const existingEmail = await User.findOne({ where: { email }, transaction: t });
+    // Username uniqueness
+    const existingUsername = await User.findOne({
+      where: { username },
+      transaction: t,
+    });
+    if (existingUsername) {
+      await t.rollback();
+      return sendValidation(res, [
+        { field: "username", message: "Username is already taken." },
+      ]);
+    }
+
+    // Email uniqueness (if provided)
+    if (email) {
+      const existingEmail = await User.findOne({
+        where: { email },
+        transaction: t,
+      });
       if (existingEmail) {
         await t.rollback();
-        return res.status(400).json({ error: "Email is already registered" });
+        return sendValidation(res, [
+          { field: "email", message: "Email is already registered." },
+        ]);
       }
     }
 
-    // 🎓 Admission number (for students)
+    // Admission number uniqueness for students
     if (roleArr.includes("student") && admission_number) {
-      const existingAdmission = await User.findOne({ where: { admission_number }, transaction: t });
+      const existingAdmission = await User.findOne({
+        where: { admission_number },
+        transaction: t,
+      });
       if (existingAdmission) {
         await t.rollback();
-        return res.status(400).json({ error: "Admission number is already in use" });
+        return sendValidation(res, [
+          {
+            field: "admission_number",
+            message: "Admission number is already in use.",
+          },
+        ]);
       }
     }
 
-    // 🔐 Password
     const hashedPassword = password ? await bcrypt.hash(password, 10) : null;
 
     const newUser = await User.create(
@@ -110,35 +150,40 @@ exports.registerUser = async (req, res) => {
       { transaction: t }
     );
 
-    // 🎭 Assign roles
+    // Resolve roles by slug or name
     const dbRoles = await Role.findAll({
       where: {
-        [Op.or]: [
-          { slug: roleArr },
-          { name: roleArr },
-        ],
+        [Op.or]: [{ slug: roleArr }, { name: roleArr }],
       },
       transaction: t,
     });
 
     if (!dbRoles.length) {
       await t.rollback();
-      return res.status(400).json({ error: "No valid roles found" });
+      return sendValidation(res, [
+        { field: "roles", message: "No valid roles found." },
+      ]);
     }
 
     await newUser.setRoles(dbRoles, { transaction: t });
 
-    // 🔗 Always link to Employee if internal ID provided
+    // Link employee if provided
     if (employee_internal_id) {
-      const employee = await Employee.findByPk(employee_internal_id, { transaction: t });
+      const employee = await Employee.findByPk(employee_internal_id, {
+        transaction: t,
+      });
       if (!employee) {
         await t.rollback();
-        return res.status(404).json({ error: "Employee record not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Employee record not found" });
       }
 
       if (employee.user_id) {
         await t.rollback();
-        return res.status(400).json({ error: "This employee already has a user account" });
+        return sendValidation(res, [
+          { field: "employee_internal_id", message: "Employee already linked to a user." },
+        ]);
       }
 
       await employee.update({ user_id: newUser.id }, { transaction: t });
@@ -150,6 +195,7 @@ exports.registerUser = async (req, res) => {
     delete clean.password;
 
     return res.status(201).json({
+      success: true,
       message: "User registered successfully",
       user: clean,
       roles: dbRoles.map((r) => r.slug),
@@ -157,12 +203,11 @@ exports.registerUser = async (req, res) => {
   } catch (error) {
     await t.rollback();
     console.error("❌ Error during registration:", error);
-    return res.status(500).json({ error: "Failed to register user", details: error.message });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to register user" });
   }
 };
-
-
-
 
 /* =========================================================
    LOGIN
@@ -195,7 +240,9 @@ exports.loginUser = async (req, res) => {
         const effectiveName = google_name || name;
 
         if (!effectiveEmail || !effectiveName) {
-          return res.status(400).json({ error: "google_email & google_name required" });
+          return sendValidation(res, [
+            { field: "google_email", message: "google_email & google_name required." },
+          ]);
         }
 
         // Attach or create
@@ -225,7 +272,9 @@ exports.loginUser = async (req, res) => {
       // Normal login
       const loginField = login || email || username;
       if (!loginField || !password) {
-        return res.status(400).json({ error: "Login and password required" });
+        return sendValidation(res, [
+          { field: "login", message: "Login and password are required." },
+        ]);
       }
 
       user = await User.findOne({
@@ -234,14 +283,15 @@ exports.loginUser = async (req, res) => {
       });
 
       if (!user || !user.password) {
-        return res.status(401).json({ error: "Invalid credentials" });
+        return res.status(401).json({ success: false, message: "Invalid credentials" });
       }
 
       const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) return res.status(401).json({ error: "Invalid password" });
+      if (!isMatch)
+        return res.status(401).json({ success: false, message: "Invalid password" });
     }
 
-    const roleSlugs = user.roles.map((r) => r.slug);
+    const roleSlugs = (user.roles || []).map((r) => r.slug);
 
     const token = jwt.sign(
       {
@@ -259,6 +309,7 @@ exports.loginUser = async (req, res) => {
     delete userData.password;
 
     return res.status(200).json({
+      success: true,
       message: "Login successful",
       token,
       user: userData,
@@ -266,7 +317,7 @@ exports.loginUser = async (req, res) => {
     });
   } catch (error) {
     console.error("Error during login:", error);
-    return res.status(500).json({ error: "Login failed", details: error.message });
+    return res.status(500).json({ success: false, message: "Login failed" });
   }
 };
 
@@ -276,47 +327,109 @@ exports.loginUser = async (req, res) => {
 exports.updateUserAndRoles = async (req, res) => {
   const t = await sequelize.transaction();
   try {
-    const userId = req.params.id;
+    const userId = String(req.params.id || "").trim();
     const { name, username, email, password, roles } = req.body;
 
-    if (!userId) {
-      await t.rollback();
-      return res.status(400).json({ message: "userId is required" });
+    const errors = [];
+
+    // Basic validations
+    if (!userId) errors.push({ field: "id", message: "User id is required." });
+    if (!name) errors.push({ field: "name", message: "Name is required." });
+    if (!username)
+      errors.push({ field: "username", message: "Username is required." });
+    if (!Array.isArray(roles) || roles.length === 0)
+      errors.push({ field: "roles", message: "Select at least one role." });
+
+    // Staff need email
+    if (needEmail(roles) && !email) {
+      errors.push({
+        field: "email",
+        message: "Email is required for staff roles.",
+      });
     }
-    if (!Array.isArray(roles) || roles.length === 0) {
-      await t.rollback();
-      return res.status(400).json({ message: "roles array is required" });
+    if (email && !isEmail(email)) {
+      errors.push({ field: "email", message: "Invalid email address." });
+    }
+    if (password && String(password).length < 6) {
+      errors.push({
+        field: "password",
+        message: "Password must be at least 6 characters.",
+      });
     }
 
+    // Permissions: coordinator can only manage student role
+    const requester = req.user || req.authUser || {};
+    const requesterRoles = Array.isArray(requester.roles)
+      ? requester.roles
+      : requester.role
+      ? [requester.role]
+      : [];
+    const isCoordinator = requesterRoles.includes("academic_coordinator");
+    if (isCoordinator && roles.some((r) => r !== "student")) {
+      errors.push({
+        field: "roles",
+        message: "Academic Coordinator can only assign the 'student' role.",
+      });
+    }
+
+    if (errors.length) {
+      await t.rollback();
+      return sendValidation(res, errors);
+    }
+
+    // Ensure user exists
     const user = await User.findByPk(userId, { transaction: t });
     if (!user) {
       await t.rollback();
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    if (needEmail(roles) && !email) {
-      await t.rollback();
-      return res.status(400).json({ message: "Email is required for staff roles" });
+    // Uniqueness (exclude current user)
+    if (username) {
+      const existsUsername = await User.findOne({
+        where: { username, id: { [Op.ne]: userId } },
+        transaction: t,
+      });
+      if (existsUsername) {
+        await t.rollback();
+        return sendValidation(res, [
+          { field: "username", message: "Username already in use." },
+        ]);
+      }
+    }
+    if (email) {
+      const existsEmail = await User.findOne({
+        where: { email, id: { [Op.ne]: userId } },
+        transaction: t,
+      });
+      if (existsEmail) {
+        await t.rollback();
+        return sendValidation(res, [
+          { field: "email", message: "Email already in use." },
+        ]);
+      }
     }
 
-    const payload = {};
-    if (name) payload.name = name;
-    if (username) payload.username = username;
-    if (email) payload.email = email;
-    if (password) payload.password = await bcrypt.hash(password, 10);
-
-    await user.update(payload, { transaction: t });
-
+    // Validate roles
     const dbRoles = await Role.findAll({
       where: { [Op.or]: [{ slug: roles }, { name: roles }] },
       transaction: t,
     });
-
     if (dbRoles.length !== roles.length) {
+      const found = new Set(dbRoles.map((r) => r.slug));
+      const missing = roles.filter((r) => !found.has(r));
       await t.rollback();
-      return res.status(400).json({ message: "One or more roles not found" });
+      return sendValidation(res, [
+        { field: "roles", message: `Unknown roles: ${missing.join(", ")}` },
+      ]);
     }
 
+    // Prepare payload
+    const payload = { name, username, email: email || null };
+    if (password) payload.password = await bcrypt.hash(password, 10);
+
+    // Update & set roles
+    await user.update(payload, { transaction: t });
     await user.setRoles(dbRoles, { transaction: t });
 
     await t.commit();
@@ -326,142 +439,259 @@ exports.updateUserAndRoles = async (req, res) => {
     });
 
     return res.json({
+      success: true,
       message: "User updated",
       user: {
         ...fresh.toJSON(),
-        roles: fresh.roles.map((r) => r.slug),
+        roles: (fresh.roles || []).map((r) => r.slug),
       },
     });
   } catch (e) {
     await t.rollback();
-    console.error("PUT /super-admin/update-role error:", e);
-    return res.status(500).json({ message: "Failed to update user", error: e.message });
+    console.error("PUT /users/:id update error:", e);
+
+    if (e.name === "SequelizeValidationError") {
+      const details =
+        e.errors?.map((er) => ({ field: er.path, message: er.message })) || [];
+      return sendValidation(res, details);
+    }
+    if (e.name === "SequelizeUniqueConstraintError") {
+      const details =
+        e.errors?.map((er) => ({
+          field: er.path?.includes("username")
+            ? "username"
+            : er.path?.includes("email")
+            ? "email"
+            : er.path,
+          message: "Already in use.",
+        })) || [];
+      return sendValidation(res, details);
+    }
+
+    return res.status(500).json({ success: false, message: "Failed to update user" });
   }
 };
 
 /* =========================================================
-   LIST USERS (admin/superadmin)
+   LIST USERS (admin/superadmin/coordinator)
 ========================================================= */
 exports.listUsers = async (req, res) => {
   try {
     const currentUserRoles = req.user?.roles || [];
-
-    const whereClause = {};
-    const includeRoles = [{ model: Role, as: "roles", attributes: ["slug", "name"] }];
-
-    // If the user is only an academic_coordinator, restrict to students
     const isCoordinator = currentUserRoles.includes("academic_coordinator");
-    const isAdminOrSuper = currentUserRoles.includes("admin") || currentUserRoles.includes("superadmin");
+    const isAdminOrSuper =
+      currentUserRoles.includes("admin") || currentUserRoles.includes("superadmin");
 
-    if (isCoordinator && !isAdminOrSuper) {
-      // Sequelize will filter users whose roles include 'student'
-      whereClause["$roles.slug$"] = "student";
-    }
+    const roleInclude = {
+      model: Role,
+      as: "roles",
+      attributes: ["slug", "name"],
+      through: { attributes: [] },
+      ...(isCoordinator && !isAdminOrSuper
+        ? { where: { slug: "student" }, required: true }
+        : {}),
+    };
 
     const users = await User.findAll({
-      where: whereClause,
       attributes: ["id", "name", "username", "email", "admission_number", "status"],
-      include: includeRoles,
+      include: [roleInclude],
       order: [["id", "ASC"]],
+      distinct: true,
     });
 
     res.json({
+      success: true,
       users: users.map((u) => ({
         ...u.toJSON(),
-        roles: u.roles.map((r) => r.slug),
+        roles: (u.roles || []).map((r) => r.slug),
       })),
     });
   } catch (e) {
     console.error("GET /users/all error:", e);
-    res.status(500).json({ message: "Failed to fetch users" });
+    res.status(500).json({ success: false, message: "Failed to fetch users" });
   }
 };
 
-
+/* =========================================================
+   LIST STUDENTS (paged; optional)
+========================================================= */
 exports.listStudents = async (req, res) => {
   try {
     const { page = 1, limit = 10, class_id, section_id } = req.query;
     const offset = (page - 1) * parseInt(limit, 10);
 
-    // Only students if coordinator, otherwise all roles
     const currentUserRoles = req.user?.roles || [];
-    const isCoordinator  = currentUserRoles.includes("academic_coordinator");
-    const isAdminOrSuper = currentUserRoles.includes("admin") || currentUserRoles.includes("superadmin");
+    const isCoordinator = currentUserRoles.includes("academic_coordinator");
+    const isAdminOrSuper =
+      currentUserRoles.includes("admin") || currentUserRoles.includes("superadmin");
 
-    // Base where: filter by class or section if provided
     const where = {};
-    if (class_id)   where.class_id   = class_id;
+    if (class_id) where.class_id = class_id;
     if (section_id) where.section_id = section_id;
 
-    // Build role include
     const roleInclude = {
       model: Role,
       as: "roles",
-      attributes: ["slug","name"],
-      through: { attributes: [] }
+      attributes: ["slug", "name"],
+      through: { attributes: [] },
+      ...(isCoordinator && !isAdminOrSuper
+        ? { where: { slug: "student" }, required: true }
+        : {}),
     };
-    if (isCoordinator && !isAdminOrSuper) {
-      roleInclude.where    = { slug: "student" };
-      roleInclude.required = true;
-    }
 
-    // Query with count for pagination
     const { count, rows } = await User.findAndCountAll({
       where,
       offset,
       limit: parseInt(limit, 10),
-      order: [["id","ASC"]],
+      order: [["id", "ASC"]],
       attributes: [
-        "id","name","username","email","admission_number",
-        "status","class_id","section_id"
+        "id",
+        "name",
+        "username",
+        "email",
+        "admission_number",
+        "status",
+        "class_id",
+        "section_id",
       ],
-      include: [ roleInclude ]
+      include: [roleInclude],
+      distinct: true,
     });
 
-    // Map into the shape your front‑end expects
-    const students = rows.map(u => {
+    const students = rows.map((u) => {
       const obj = u.toJSON();
       return {
         ...obj,
-        // ensure status never undefined
         status: obj.status || "active",
-        roles: obj.roles.map(r => r.slug)
+        roles: (obj.roles || []).map((r) => r.slug),
       };
     });
 
     return res.json({
+      success: true,
       students,
       totalPages: Math.ceil(count / limit),
-      currentPage: parseInt(page, 10)
+      currentPage: parseInt(page, 10),
     });
   } catch (e) {
-    console.error("GET /users/students error:", e);
-    return res.status(500).json({ message: "Failed to fetch students" });
+    console.error("GET /users/listStudents error:", e);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch students" });
   }
 };
 
 /* =========================================================
-   DELETE USER (admin/superadmin)
+   GET STUDENTS (with Student profile join)
+========================================================= */
+exports.getStudents = async (req, res) => {
+  try {
+    const { page = 1, limit = 10, class_id, section_id } = req.query;
+    const offset = (page - 1) * parseInt(limit, 10);
+
+    const currentRoles = req.user?.roles || [];
+    const isCoord = currentRoles.includes("academic_coordinator");
+    const isAdminOrSuper =
+      currentRoles.includes("admin") || currentRoles.includes("superadmin");
+
+    const studentWhere = {};
+    if (class_id) studentWhere.class_id = class_id;
+    if (section_id) studentWhere.section_id = section_id;
+
+    const roleInclude = {
+      model: Role,
+      as: "roles",
+      attributes: ["slug", "name"],
+      through: { attributes: [] },
+      ...(isCoord && !isAdminOrSuper
+        ? { where: { slug: "student" }, required: true }
+        : {}),
+    };
+
+    const { count, rows } = await User.findAndCountAll({
+      offset,
+      limit: parseInt(limit, 10),
+      order: [["id", "ASC"]],
+      attributes: [
+        "id",
+        "name",
+        "username",
+        "email",
+        "admission_number",
+        "status",
+      ],
+      include: [
+        roleInclude,
+        {
+          model: Student,
+          as: "studentProfile",
+          where: studentWhere,
+          attributes: ["class_id", "section_id"],
+          required: true,
+          include: [
+            { model: Class, as: "Class", attributes: ["class_name"] },
+            { model: Section, as: "Section", attributes: ["section_name"] },
+          ],
+        },
+      ],
+      distinct: true,
+    });
+
+    const students = rows.map((u) => {
+      const obj = u.toJSON();
+      return {
+        id: obj.id,
+        name: obj.name,
+        username: obj.username,
+        email: obj.email,
+        admission_number: obj.admission_number,
+        status: obj.status,
+        roles: (obj.roles || []).map((r) => r.slug),
+        class_id: obj.studentProfile.class_id,
+        section_id: obj.studentProfile.section_id,
+        class_name: obj.studentProfile.Class.class_name,
+        section_name: obj.studentProfile.Section.section_name,
+      };
+    });
+
+    return res.json({
+      success: true,
+      students,
+      totalPages: Math.ceil(count / limit),
+      currentPage: parseInt(page, 10),
+    });
+  } catch (err) {
+    console.error("GET /users/students error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: err.message || "Failed to fetch students" });
+  }
+};
+
+/* =========================================================
+   DELETE USER (superadmin only)
 ========================================================= */
 exports.deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
 
     if (!req.user.roles.includes("superadmin")) {
-      return res.status(403).json({ message: "Only superadmin can delete users" });
+      return res
+        .status(403)
+        .json({ success: false, message: "Only superadmin can delete users" });
     }
 
     const user = await User.findByPk(id);
-    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!user)
+      return res.status(404).json({ success: false, message: "User not found" });
 
     await user.destroy();
-    res.json({ message: "User deleted" });
+    res.json({ success: true, message: "User deleted" });
   } catch (e) {
     console.error("DELETE /users/:id error:", e);
-    res.status(500).json({ message: "Failed to delete user" });
+    res.status(500).json({ success: false, message: "Failed to delete user" });
   }
 };
-
 
 /* =========================================================
    EDIT PROFILE (self)
@@ -471,12 +701,20 @@ exports.editUserProfile = async (req, res) => {
     const { name, email, currentPassword, newPassword } = req.body;
     const userId = req.user.id;
 
+    if (email && !isEmail(email)) {
+      return sendValidation(res, [
+        { field: "email", message: "Invalid email address." },
+      ]);
+    }
+
     if (email) {
       const existingUser = await User.findOne({
         where: { email, id: { [Op.ne]: userId } },
       });
       if (existingUser) {
-        return res.status(400).json({ message: "Email is already in use by another account." });
+        return sendValidation(res, [
+          { field: "email", message: "Email is already in use by another account." },
+        ]);
       }
     }
 
@@ -496,9 +734,22 @@ exports.editUserProfile = async (req, res) => {
 
     if (currentPassword && newPassword) {
       const user = await User.findByPk(userId);
-      const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+      const isPasswordValid = await bcrypt.compare(
+        currentPassword,
+        user.password
+      );
       if (!isPasswordValid) {
-        return res.status(401).json({ message: "Current password is incorrect." });
+        return res
+          .status(401)
+          .json({ success: false, message: "Current password is incorrect." });
+      }
+      if (String(newPassword).length < 6) {
+        return sendValidation(res, [
+          {
+            field: "newPassword",
+            message: "New password must be at least 6 characters.",
+          },
+        ]);
       }
       const hashedNewPassword = await bcrypt.hash(newPassword, 10);
       updatedData.password = hashedNewPassword;
@@ -508,13 +759,19 @@ exports.editUserProfile = async (req, res) => {
     const updatedUser = await User.findByPk(userId);
 
     if (updatedUser.profilePhoto) {
-      updatedUser.profilePhoto = `${req.protocol}://${req.get("host")}${updatedUser.profilePhoto}`;
+      updatedUser.profilePhoto = `${req.protocol}://${req.get(
+        "host"
+      )}${updatedUser.profilePhoto}`;
     }
 
-    return res.status(200).json({ message: "Profile updated successfully!", user: updatedUser });
+    return res
+      .status(200)
+      .json({ success: true, message: "Profile updated successfully!", user: updatedUser });
   } catch (error) {
     console.error("Error updating profile:", error);
-    return res.status(500).json({ message: "Error updating profile", error: error.message });
+    return res
+      .status(500)
+      .json({ success: false, message: "Error updating profile" });
   }
 };
 
@@ -530,111 +787,28 @@ exports.getUserProfile = async (req, res) => {
       include: [{ model: Role, as: "roles", attributes: ["name", "slug"] }],
     });
 
-    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!user)
+      return res.status(404).json({ success: false, message: "User not found" });
 
     if (user.profilePhoto) {
-      user.profilePhoto = `${req.protocol}://${req.get("host")}${user.profilePhoto}`;
+      user.profilePhoto = `${req.protocol}://${req.get("host")}${
+        user.profilePhoto
+      }`;
     }
 
     return res.status(200).json({
+      success: true,
       message: "User profile fetched successfully",
       user: {
         ...user.toJSON(),
-        roles: user.roles.map((r) => r.slug),
+        roles: (user.roles || []).map((r) => r.slug),
       },
     });
   } catch (error) {
     console.error("Error fetching profile:", error);
-    return res.status(500).json({ message: "Failed to fetch user profile", error: error.message });
-  }
-};
-
-/* =========================================================
-   GET STUDENTS
-========================================================= */
-// controllers/UserController.js
-
-exports.getStudents = async (req, res) => {
-  try {
-    const { page = 1, limit = 10, class_id, section_id } = req.query;
-    const offset = (page - 1) * parseInt(limit, 10);
-
-    const currentRoles  = req.user?.roles || [];
-    const isCoord       = currentRoles.includes("academic_coordinator");
-    const isAdminOrSuper= currentRoles.includes("admin") || currentRoles.includes("superadmin");
-
-    // Filter Student by class/section if passed
-    const studentWhere = {};
-    if (class_id)   studentWhere.class_id   = class_id;
-    if (section_id) studentWhere.section_id = section_id;
-
-    // Role include (restrict to students for coordinators)
-    const roleInclude = {
-      model: Role,
-      as: "roles",
-      attributes: ["slug","name"],
-      through: { attributes: [] },
-    };
-    if (isCoord && !isAdminOrSuper) {
-      roleInclude.where    = { slug: "student" };
-      roleInclude.required = true;
-    }
-
-    const { count, rows } = await User.findAndCountAll({
-      offset,
-      limit: parseInt(limit, 10),
-      order: [["id","ASC"]],
-      attributes: [
-        "id",
-        "name",
-        "username",
-        "email",
-        "admission_number",
-        "status",
-      ],
-      include: [
-        roleInclude,
-        {
-          model: Student,
-          as: "studentProfile",          // whatever alias you’ve defined
-          where: studentWhere,
-          attributes: ["class_id","section_id"],
-          required: true,               // only users who actually have a student record
-          include: [
-            { model: Class,   as: "Class",   attributes: ["class_name"] },
-            { model: Section, as: "Section", attributes: ["section_name"] },
-          ]
-        }
-      ]
-    });
-
-    const students = rows.map(u => {
-      const obj = u.toJSON();
-      return {
-        id:             obj.id,
-        name:           obj.name,
-        username:       obj.username,
-        email:          obj.email,
-        admission_number: obj.admission_number,
-        status:         obj.status,
-        roles:          obj.roles.map(r => r.slug),
-        class_id:       obj.studentProfile.class_id,
-        section_id:     obj.studentProfile.section_id,
-        class_name:     obj.studentProfile.Class.class_name,
-        section_name:   obj.studentProfile.Section.section_name,
-      };
-    });
-
-    return res.json({
-      students,
-      totalPages: Math.ceil(count / limit),
-      currentPage: parseInt(page, 10),
-    });
-  } catch (err) {
-    console.error("GET /users/students error:", err);
     return res
       .status(500)
-      .json({ message: err.message || "Failed to fetch students" });
+      .json({ success: false, message: "Failed to fetch user profile" });
   }
 };
 
@@ -645,25 +819,30 @@ exports.saveToken = async (req, res) => {
   try {
     const { username, token } = req.body;
     if (!username || !token) {
-      return res.status(400).json({ success: false, message: "Username and token are required" });
+      return sendValidation(res, [
+        { field: "username", message: "Username is required." },
+        { field: "token", message: "Token is required." },
+      ]);
     }
     const user = await User.findOne({ where: { username } });
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
     }
     user.fcmToken = token;
     await user.save();
     return res.status(200).json({ success: true, user });
   } catch (error) {
     console.error("Error saving FCM token:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to save token" });
   }
 };
 
-
-
 /* =========================================================
-   DISABLE USER (with coordinator privilege for students)
+   DISABLE USER (admin/superadmin; coordinator only for students)
 ========================================================= */
 exports.disableUser = async (req, res) => {
   try {
@@ -674,14 +853,13 @@ exports.disableUser = async (req, res) => {
       include: [{ model: Role, as: "roles", attributes: ["slug"] }],
     });
 
-    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
     if (user.status === "disabled") {
-      return res.status(400).json({ message: "User is already disabled" });
+      return res.status(400).json({ success: false, message: "User is already disabled" });
     }
 
-    // check roles
-    const targetIsStudent = user.roles.some((r) => r.slug === "student");
-    const currentUserRoles = req.user.roles;
+    const targetIsStudent = (user.roles || []).some((r) => r.slug === "student");
+    const currentUserRoles = req.user.roles || [];
 
     const canDisable =
       currentUserRoles.includes("superadmin") ||
@@ -689,7 +867,9 @@ exports.disableUser = async (req, res) => {
       (currentUserRoles.includes("academic_coordinator") && targetIsStudent);
 
     if (!canDisable) {
-      return res.status(403).json({ message: "You are not allowed to disable this user" });
+      return res
+        .status(403)
+        .json({ success: false, message: "You are not allowed to disable this user" });
     }
 
     await user.update({
@@ -699,16 +879,15 @@ exports.disableUser = async (req, res) => {
       disableReason: reason || "No reason provided",
     });
 
-    res.json({ message: "User disabled successfully" });
+    res.json({ success: true, message: "User disabled successfully" });
   } catch (error) {
     console.error("Error disabling user:", error);
-    res.status(500).json({ message: "Failed to disable user", error: error.message });
+    res.status(500).json({ success: false, message: "Failed to disable user" });
   }
 };
 
-
 /* =========================================================
-   ENABLE USER (with coordinator privilege for students)
+   ENABLE USER (admin/superadmin; coordinator only for students)
 ========================================================= */
 exports.enableUser = async (req, res) => {
   try {
@@ -719,12 +898,11 @@ exports.enableUser = async (req, res) => {
     });
 
     if (!user || user.status !== "disabled") {
-      return res.status(404).json({ message: "Disabled user not found" });
+      return res.status(404).json({ success: false, message: "Disabled user not found" });
     }
 
-    // check roles
-    const targetIsStudent = user.roles.some((r) => r.slug === "student");
-    const currentUserRoles = req.user.roles;
+    const targetIsStudent = (user.roles || []).some((r) => r.slug === "student");
+    const currentUserRoles = req.user.roles || [];
 
     const canEnable =
       currentUserRoles.includes("superadmin") ||
@@ -732,7 +910,9 @@ exports.enableUser = async (req, res) => {
       (currentUserRoles.includes("academic_coordinator") && targetIsStudent);
 
     if (!canEnable) {
-      return res.status(403).json({ message: "You are not allowed to enable this user" });
+      return res
+        .status(403)
+        .json({ success: false, message: "You are not allowed to enable this user" });
     }
 
     await user.update({
@@ -742,31 +922,33 @@ exports.enableUser = async (req, res) => {
       disableReason: null,
     });
 
-    res.json({ message: "User restored successfully" });
+    res.json({ success: true, message: "User restored successfully" });
   } catch (error) {
     console.error("Error restoring user:", error);
-    res.status(500).json({ message: "Failed to restore user", error: error.message });
+    res.status(500).json({ success: false, message: "Failed to restore user" });
   }
 };
 
-
+/* =========================================================
+   EMPLOYEE USERS (non-students)
+========================================================= */
 exports.getEmployeeUsers = async (req, res) => {
   try {
     const { department_id, page = 1, limit = 10 } = req.query;
-    const offset = (page - 1) * limit;
+    const offset = (page - 1) * parseInt(limit, 10);
 
     const whereEmployee = {};
     if (department_id) whereEmployee.department_id = department_id;
 
     const { count, rows } = await User.findAndCountAll({
       offset,
-      limit: parseInt(limit),
+      limit: parseInt(limit, 10),
       attributes: ["id", "name", "username", "email", "status"],
       include: [
         {
           model: Role,
           as: "roles",
-          where: { slug: { [Op.ne]: "student" } }, // ❗ Exclude users with 'student' role
+          where: { slug: { [Op.ne]: "student" } }, // Exclude student-only users
           attributes: ["id", "slug", "name"],
         },
         {
@@ -778,13 +960,13 @@ exports.getEmployeeUsers = async (req, res) => {
           include: [
             {
               model: Department,
-              as: "department", // ✅ corrected alias
+              as: "department",
               attributes: ["id", "name"],
             },
           ],
         },
       ],
-      distinct: true, // important to get correct count with includes
+      distinct: true,
       order: [["id", "ASC"]],
     });
 
@@ -792,21 +974,22 @@ exports.getEmployeeUsers = async (req, res) => {
       const json = u.toJSON();
       return {
         ...json,
-        roles: json.roles.map((r) => r.slug),
+        roles: (json.roles || []).map((r) => r.slug),
         department_id: json.employee?.department_id || null,
-        department_name: json.employee?.department?.name || "N/A", // ✅ corrected alias
+        department_name: json.employee?.department?.name || "N/A",
       };
     });
 
     return res.json({
+      success: true,
       employees,
       totalPages: Math.ceil(count / limit),
-      currentPage: parseInt(page),
+      currentPage: parseInt(page, 10),
     });
   } catch (err) {
     console.error("getEmployeeUsers error:", err);
-    console.error("💥 Stack:", err.stack);
-    res.status(500).json({ error: "Internal server error", details: err.message });
+    res
+      .status(500)
+      .json({ success: false, message: "Internal server error" });
   }
 };
-

@@ -1,21 +1,14 @@
 // controllers/substitutionController.js
-const { UniqueConstraintError } = require('sequelize');
-const { Substitution, Employee, User, Class, Subject, Student, Period } = require('../models');
+const { UniqueConstraintError, fn, col } = require('sequelize');
+const models = require('../models');
+const { Substitution, User, Class, Subject, Student, Period } = models;
 
-/** Map the logged-in User to their Employee.id */
-async function getEmployeeIdFromReq(req) {
-  if (req.user?.employeeId) return req.user.employeeId;
-  const userId = req.user?.id;
-  if (!userId) return null;
-  const emp = await Employee.findOne({
-    where: { user_id: userId },
-    attributes: ['id'],
-    raw: true,
-  });
-  return emp?.id ?? null;
+/** When teacherId/original_teacherId are Users.id, we don't need Employee mapping here */
+function getUserIdFromReq(req) {
+  return req.user?.id || null;
 }
 
-/** Create or update a substitution (teacherId & original_teacherId are EMPLOYEE IDs) */
+/** Create or update a substitution (teacherId & original_teacherId are USERS IDs) */
 exports.createSubstitution = async (req, res) => {
   try {
     const { date, periodId, classId, teacherId, original_teacherId, subjectId, day, published } = req.body;
@@ -44,7 +37,7 @@ exports.createSubstitution = async (req, res) => {
       }
     }
 
-    // Notifications
+    // Notifications (rooms keyed by user id still fine)
     const io = req.app.get('socketio');
     if (io) {
       const [periodRecord, classRecord] = await Promise.all([
@@ -74,22 +67,30 @@ exports.createSubstitution = async (req, res) => {
   }
 };
 
+/** Helper: attributes to compute display names from User includes */
+const displayNameAttrs = {
+  include: [
+    [ col('Teacher.name'), 'teacher_display_name' ],
+    [ col('OriginalTeacher.name'), 'original_teacher_display_name' ],
+  ],
+};
+
 exports.getAllSubstitutions = async (req, res) => {
   try {
     const substitutions = await Substitution.findAll({
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',          attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher',  attributes: ['id', 'name', 'email'] },
-        { model: Subject,  as: 'Subject',          attributes: ['id', 'name'] },
-        { model: Class,    as: 'Class',            attributes: ['class_name'] },
-        { model: Period,   as: 'Period',           attributes: ['period_name'] }
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject, as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] },
       ],
       order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
     return res.status(200).json(substitutions);
   } catch (error) {
     console.error('getAllSubstitutions error:', error);
-    // TEMP: surface real error during debugging
     return res.status(500).json({ error: error.message });
   }
 };
@@ -98,12 +99,13 @@ exports.getSubstitutionById = async (req, res) => {
   try {
     const { id } = req.params;
     const substitution = await Substitution.findByPk(id, {
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
-        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject, as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] }
       ]
     });
     if (!substitution) return res.status(404).json({ error: 'Substitution not found' });
@@ -195,11 +197,13 @@ exports.getSubstitutionsByDate = async (req, res) => {
 
     const substitutions = await Substitution.findAll({
       where,
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Subject,  as: 'Subject',         attributes: ['name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] }, // ✅ ensure join
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Subject, as: 'Subject',         attributes: ['name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] }
       ],
       order: [['periodId', 'ASC']]
     });
@@ -217,19 +221,21 @@ exports.getSubstitutionsForOriginalTeacherByDate = async (req, res) => {
     const { date, published } = req.query;
     if (!date) return res.status(400).json({ error: 'Date query parameter is required' });
 
-    const employeeId = await getEmployeeIdFromReq(req);
-    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserIdFromReq(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const where = { date, original_teacherId: employeeId };
+    const where = { date, original_teacherId: userId };
     if (published === 'true') where.published = true;
 
     const substitutions = await Substitution.findAll({
       where,
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher', attributes: ['id', 'name', 'email'] },
-        { model: Class,    as: 'Class',   attributes: ['class_name'] },
-        { model: Subject,  as: 'Subject', attributes: ['name'] },
-        { model: Period,   as: 'Period',  attributes: ['period_name'] },
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] }, // ✅ ensure join
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Subject, as: 'Subject',         attributes: ['name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] },
       ],
       order: [['periodId', 'ASC']]
     });
@@ -247,20 +253,21 @@ exports.getSubstitutionsForTeacherByDate = async (req, res) => {
     const { date, published } = req.query;
     if (!date) return res.status(400).json({ error: 'Date query parameter is required' });
 
-    const employeeId = await getEmployeeIdFromReq(req);
-    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserIdFromReq(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const where = { date, teacherId: employeeId };
+    const where = { date, teacherId: userId };
     if (published === 'true') where.published = true;
 
     const substitutions = await Substitution.findAll({
       where,
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Subject,  as: 'Subject',         attributes: ['name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] },
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Subject, as: 'Subject',         attributes: ['name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] },
       ],
       order: [['periodId', 'ASC']]
     });
@@ -288,12 +295,13 @@ exports.getStudentSubstitutions = async (req, res) => {
 
     const substitutionRecords = await Substitution.findAll({
       where,
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Subject,  as: 'Subject',         attributes: ['name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] },
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Subject, as: 'Subject',         attributes: ['name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] },
       ],
       order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
@@ -308,17 +316,18 @@ exports.getStudentSubstitutions = async (req, res) => {
 /** Logged-in teacher: all their assigned substitutions */
 exports.getTeacherSubstitutions = async (req, res) => {
   try {
-    const employeeId = await getEmployeeIdFromReq(req);
-    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserIdFromReq(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const substitutions = await Substitution.findAll({
-      where: { teacherId: employeeId },
+      where: { teacherId: userId },
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
-        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject, as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] }
       ],
       order: [['date', 'ASC'], ['periodId', 'ASC']]
     });
@@ -333,17 +342,18 @@ exports.getTeacherSubstitutions = async (req, res) => {
 /** Logged-in original teacher: where they were substituted */
 exports.getOriginalTeacherSubstitutions = async (req, res) => {
   try {
-    const employeeId = await getEmployeeIdFromReq(req);
-    if (!employeeId) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserIdFromReq(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const substitutions = await Substitution.findAll({
-      where: { original_teacherId: employeeId },
+      where: { original_teacherId: userId },
+      attributes: { include: displayNameAttrs.include },
       include: [
-        { model: Employee, as: 'Teacher',         attributes: ['id', 'name', 'email'] },
-        { model: Employee, as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
-        { model: Subject,  as: 'Subject',         attributes: ['id', 'name'] },
-        { model: Class,    as: 'Class',           attributes: ['class_name'] },
-        { model: Period,   as: 'Period',          attributes: ['period_name'] }
+        { model: User,    as: 'Teacher',         attributes: ['id', 'name', 'email'] },
+        { model: User,    as: 'OriginalTeacher', attributes: ['id', 'name', 'email'] },
+        { model: Subject, as: 'Subject',         attributes: ['id', 'name'] },
+        { model: Class,   as: 'Class',           attributes: ['class_name'] },
+        { model: Period,  as: 'Period',          attributes: ['period_name'] }
       ],
       order: [['date', 'ASC'], ['periodId', 'ASC']]
     });

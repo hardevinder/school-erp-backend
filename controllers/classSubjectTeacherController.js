@@ -11,13 +11,40 @@ const {
   Department,
 } = require("../models");
 
-// --- Helpers -----------------------------
+/* ------------------------------------------------------------------ */
+/* Alias helpers: auto-detect association aliases at runtime           */
+/* ------------------------------------------------------------------ */
 
+function pickAlias(associations, candidates = []) {
+  for (const c of candidates) {
+    if (associations[c]) return c;
+  }
+  // Fallback: return the first association key if present
+  const keys = Object.keys(associations || {});
+  return keys.length ? keys[0] : null;
+}
+
+// Detect alias for User.hasOne(Employee, { as: 'employee' | 'Employee' | 'employeeProfile' | ... })
+const USER_EMPLOYEE_ALIAS =
+  pickAlias(User.associations, ["employee", "Employee", "employeeProfile"]);
+
+// Detect alias for Employee.belongsTo(User, { as: 'user' | 'userAccount' | ... })
+const EMPLOYEE_USER_ALIAS =
+  pickAlias(Employee.associations, ["user", "userAccount", "User"]);
+
+// Detect alias for Employee.belongsTo(Department, { as: 'department' | 'Department' })
+const EMPLOYEE_DEPT_ALIAS =
+  pickAlias(Employee.associations, ["department", "Department"]);
+
+// Detect alias for User.belongsToMany(Role, { as: 'roles' | 'Roles' })
+const USER_ROLES_ALIAS =
+  pickAlias(User.associations, ["roles", "Roles"]);
+
+/* ------------------------------------------------------------------ */
 /**
  * Resolve an incoming teacher identifier (could be User.id or Employee.id)
  * to a valid User with the "teacher" role.
- * @param {number|string} teacher_id_from_client
- * @returns {Promise<{ user: User, employee: Employee|null }>}
+ * Returns: { user: User, employee: Employee|null }
  */
 async function resolveTeacherUser(teacher_id_from_client) {
   const incomingId = Number(teacher_id_from_client);
@@ -25,37 +52,88 @@ async function resolveTeacherUser(teacher_id_from_client) {
     throw new Error("Invalid teacher ID");
   }
 
-  // Try as User.id with teacher role
-  const user = await User.findOne({
+  // 1) Try as User.id with teacher role
+  const userAsUserId = await User.findOne({
     where: { id: incomingId },
     include: [
-      { model: Role, as: "roles", where: { slug: "teacher" }, required: true, through: { attributes: [] } },
-      // Must match your model alias: User.hasOne(Employee, { as: 'employee' })
-      { model: Employee, as: "employee", include: [{ model: Department, as: "department" }] },
-    ],
+      USER_ROLES_ALIAS && {
+        model: Role,
+        as: USER_ROLES_ALIAS,
+        where: { slug: "teacher" },
+        required: true,
+        through: { attributes: [] },
+        attributes: ["id", "slug"],
+      },
+      USER_EMPLOYEE_ALIAS && {
+        model: Employee,
+        as: USER_EMPLOYEE_ALIAS,
+        include: [
+          EMPLOYEE_DEPT_ALIAS && {
+            model: Department,
+            as: EMPLOYEE_DEPT_ALIAS,
+            attributes: ["id", "name"],
+          },
+        ].filter(Boolean),
+        attributes: ["id", "name", "department_id"],
+      },
+    ].filter(Boolean),
   });
-  if (user) return { user, employee: user.employee || null };
 
-  // Try as Employee.id -> then get its User who has teacher role
-  const employee = await Employee.findOne({
+  if (userAsUserId) {
+    const employee =
+      USER_EMPLOYEE_ALIAS ? userAsUserId[USER_EMPLOYEE_ALIAS] || null : null;
+    return { user: userAsUserId, employee };
+  }
+
+  // 2) Try as Employee.id → then get its User who has teacher role
+  const employeeAsEmpId = await Employee.findOne({
     where: { id: incomingId },
     include: [
-      { model: Department, as: "department" },
-      // Must match your model alias: Employee.belongsTo(User, { as: 'user' })
-      { model: User, as: "user", include: [{ model: Role, as: "roles", where: { slug: "teacher" }, required: true, through: { attributes: [] } }] },
-    ],
+      EMPLOYEE_DEPT_ALIAS && {
+        model: Department,
+        as: EMPLOYEE_DEPT_ALIAS,
+        attributes: ["id", "name"],
+      },
+      EMPLOYEE_USER_ALIAS && {
+        model: User,
+        as: EMPLOYEE_USER_ALIAS,
+        include: [
+          USER_ROLES_ALIAS && {
+            model: Role,
+            as: USER_ROLES_ALIAS,
+            where: { slug: "teacher" },
+            required: true,
+            through: { attributes: [] },
+            attributes: ["id", "slug"],
+          },
+          USER_EMPLOYEE_ALIAS && {
+            model: Employee,
+            as: USER_EMPLOYEE_ALIAS,
+            attributes: ["id", "name", "department_id"],
+            include: [
+              EMPLOYEE_DEPT_ALIAS && {
+                model: Department,
+                as: EMPLOYEE_DEPT_ALIAS,
+                attributes: ["id", "name"],
+              },
+            ].filter(Boolean),
+          },
+        ].filter(Boolean),
+      },
+    ].filter(Boolean),
   });
-  if (employee?.user) return { user: employee.user, employee };
+
+  if (employeeAsEmpId && EMPLOYEE_USER_ALIAS && employeeAsEmpId[EMPLOYEE_USER_ALIAS]) {
+    return { user: employeeAsEmpId[EMPLOYEE_USER_ALIAS], employee: employeeAsEmpId };
+  }
 
   throw new Error("Invalid teacher ID or user is not a teacher");
 }
 
-// --- Create ------------------------------
+/* ------------------------------------------------------------------ */
+/* Create                                                               */
+/* ------------------------------------------------------------------ */
 
-/**
- * Create new mapping (Assign Subject to Teacher for a Class & Section)
- * Accepts teacher_id as either User.id or Employee.id (resolved to User.id for storage).
- */
 exports.createClassSubjectTeacher = async (req, res) => {
   try {
     const { class_id, section_id, subject_id, teacher_id, confirmDuplicate } = req.body;
@@ -69,7 +147,8 @@ exports.createClassSubjectTeacher = async (req, res) => {
     });
     if (duplicate && !confirmDuplicate) {
       return res.status(409).json({
-        message: "An assignment with the same class, section, and subject already exists. Do you want to proceed?",
+        message:
+          "An assignment with the same class, section, and subject already exists. Do you want to proceed?",
         duplicate: true,
       });
     }
@@ -88,11 +167,10 @@ exports.createClassSubjectTeacher = async (req, res) => {
   }
 };
 
-// --- Read (All) --------------------------
+/* ------------------------------------------------------------------ */
+/* Read (All)                                                          */
+/* ------------------------------------------------------------------ */
 
-/**
- * Get all mappings with associated Class, Section, Subject, and Teacher (User + Employee) data
- */
 exports.getAllClassSubjectTeachers = async (req, res) => {
   try {
     const assignments = await ClassSubjectTeacher.findAll({
@@ -102,17 +180,28 @@ exports.getAllClassSubjectTeachers = async (req, res) => {
         { model: Subject, as: "Subject", attributes: ["id", "name"] },
         {
           model: User,
-          as: "Teacher", // alias from ClassSubjectTeacher model
+          as: "Teacher", // ensure your ClassSubjectTeacher belongsTo(User, { as: 'Teacher', foreignKey: 'teacher_id' })
           attributes: ["id", "name", "email", "status"],
           include: [
-            { model: Role, as: "roles", attributes: ["id", "slug"], through: { attributes: [] } },
-            {
-              model: Employee,
-              as: "employee", // lowercase alias — must match your model
-              attributes: ["id", "name", "department_id"], // removed employee_code to avoid unknown column error
-              include: [{ model: Department, as: "department", attributes: ["id", "name"] }],
+            USER_ROLES_ALIAS && {
+              model: Role,
+              as: USER_ROLES_ALIAS,
+              attributes: ["id", "slug"],
+              through: { attributes: [] },
             },
-          ],
+            USER_EMPLOYEE_ALIAS && {
+              model: Employee,
+              as: USER_EMPLOYEE_ALIAS,
+              attributes: ["id", "name", "department_id"],
+              include: [
+                EMPLOYEE_DEPT_ALIAS && {
+                  model: Department,
+                  as: EMPLOYEE_DEPT_ALIAS,
+                  attributes: ["id", "name"],
+                },
+              ].filter(Boolean),
+            },
+          ].filter(Boolean),
         },
       ],
       order: [
@@ -128,7 +217,9 @@ exports.getAllClassSubjectTeachers = async (req, res) => {
   }
 };
 
-// --- Read (One) --------------------------
+/* ------------------------------------------------------------------ */
+/* Read (One)                                                          */
+/* ------------------------------------------------------------------ */
 
 exports.getClassSubjectTeacherById = async (req, res) => {
   try {
@@ -145,14 +236,25 @@ exports.getClassSubjectTeacherById = async (req, res) => {
           as: "Teacher",
           attributes: ["id", "name", "email", "status"],
           include: [
-            { model: Role, as: "roles", attributes: ["id", "slug"], through: { attributes: [] } },
-            {
-              model: Employee,
-              as: "employee",
-              attributes: ["id", "name", "department_id"], // removed employee_code
-              include: [{ model: Department, as: "department", attributes: ["id", "name"] }],
+            USER_ROLES_ALIAS && {
+              model: Role,
+              as: USER_ROLES_ALIAS,
+              attributes: ["id", "slug"],
+              through: { attributes: [] },
             },
-          ],
+            USER_EMPLOYEE_ALIAS && {
+              model: Employee,
+              as: USER_EMPLOYEE_ALIAS,
+              attributes: ["id", "name", "department_id"],
+              include: [
+                EMPLOYEE_DEPT_ALIAS && {
+                  model: Department,
+                  as: EMPLOYEE_DEPT_ALIAS,
+                  attributes: ["id", "name"],
+                },
+              ].filter(Boolean),
+            },
+          ].filter(Boolean),
         },
       ],
     });
@@ -164,12 +266,10 @@ exports.getClassSubjectTeacherById = async (req, res) => {
   }
 };
 
-// --- Update ------------------------------
+/* ------------------------------------------------------------------ */
+/* Update                                                              */
+/* ------------------------------------------------------------------ */
 
-/**
- * Update an assignment
- * Accepts teacher_id as either User.id or Employee.id (resolved to User.id for storage).
- */
 exports.updateClassSubjectTeacher = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -193,7 +293,8 @@ exports.updateClassSubjectTeacher = async (req, res) => {
     });
     if (duplicate && !confirmDuplicate) {
       return res.status(409).json({
-        message: "An assignment with the same class, section, and subject already exists. Do you want to proceed?",
+        message:
+          "An assignment with the same class, section, and subject already exists. Do you want to proceed?",
         duplicate: true,
       });
     }
@@ -212,7 +313,9 @@ exports.updateClassSubjectTeacher = async (req, res) => {
   }
 };
 
-// --- Delete ------------------------------
+/* ------------------------------------------------------------------ */
+/* Delete                                                              */
+/* ------------------------------------------------------------------ */
 
 exports.deleteClassSubjectTeacher = async (req, res) => {
   try {
@@ -230,12 +333,10 @@ exports.deleteClassSubjectTeacher = async (req, res) => {
   }
 };
 
-// --- Self (Subjects for logged-in teacher) --
+/* ------------------------------------------------------------------ */
+/* Self (Subjects for logged-in teacher)                               */
+/* ------------------------------------------------------------------ */
 
-/**
- * Get subjects and classes assigned to the logged-in teacher (deduplicated)
- * Uses req.user.id (User id) from auth middleware
- */
 exports.getSubjectsForTeacher = async (req, res) => {
   try {
     const teacherUserId = Number(req.user?.id);
