@@ -83,6 +83,7 @@ const studentCoScholasticEvaluationRoutes = require('./routes/studentCoScholasti
 const studentRemarkRoutes = require('./routes/studentRemarkRoutes'); // ✅ NEW
 const reportCardFormatRoutes = require('./routes/reportCardFormatRoutes'); // ✅ NEW
 const reportCardRoutes = require('./routes/reportCardRoutes'); // ✅ NEW
+const integrationsWhatsAppRoutes = require('./routes/integrationsWhatsApp');
 
 
 
@@ -229,6 +230,7 @@ app.use('/coscholastic-evaluations', studentCoScholasticEvaluationRoutes); // �
 app.use('/student-remarks', studentRemarkRoutes); // ✅ Add this line
 app.use('/report-card-formats', reportCardFormatRoutes);
 app.use('/report-card', reportCardRoutes); 
+app.use('/integrations/whatsapp', integrationsWhatsAppRoutes);
 
 
 
