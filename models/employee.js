@@ -4,16 +4,7 @@
 const { Model } = require("sequelize");
 
 module.exports = (sequelize, DataTypes) => {
-  class Employee extends Model {
-    // Virtual fallback: always give something printable
-    get display_name() {
-      const selfName = this.getDataValue("name");
-      // If include loaded, prefer userAccount.name when self name is empty
-      const ua = this.get("userAccount");
-      const uaName = ua && (ua.name || (ua.get ? ua.get("name") : undefined));
-      return (selfName && selfName.trim()) || uaName || "";
-    }
-  }
+  class Employee extends Model {}
 
   Employee.init(
     {
@@ -129,16 +120,16 @@ module.exports = (sequelize, DataTypes) => {
       user_id: {
         type: DataTypes.INTEGER,
         allowNull: true,
-        references: { model: "Users", key: "id" },
-        // If you want 1:1 User↔Employee, uncomment the next line
-        // unique: true,
+        references: { model: "users", key: "id" }, // match actual table name
+        // unique: true, // uncomment if enforcing 1:1 User↔Employee
       },
 
-      // ✅ Expose display_name to JSON without storing it in DB
+      // ✅ Scalar-only virtual (no association access → no cycles)
       display_name: {
         type: DataTypes.VIRTUAL,
         get() {
-          return this.display_name; // uses the getter above
+          const v = this.getDataValue("name");
+          return (typeof v === "string" ? v.trim() : "") || "";
         },
         set() {
           throw new Error("display_name is a virtual field and cannot be set");
@@ -152,10 +143,11 @@ module.exports = (sequelize, DataTypes) => {
       timestamps: true,
       indexes: [
         { unique: true, fields: ["employee_id"] },
-        { unique: true, fields: ["aadhaar_number"] }, // allows multiple NULLs in most DBs
-        // If you enforce one employee per user, add:
-        // { unique: true, fields: ["user_id"] },
+        { unique: true, fields: ["aadhaar_number"] }, // MySQL allows multiple NULLs
       ],
+      defaultScope: {
+        // Do not auto-include associations (prevents cycles)
+      },
       hooks: {
         beforeValidate(emp) {
           if (typeof emp.name === "string") emp.name = emp.name.trim();
@@ -174,12 +166,12 @@ module.exports = (sequelize, DataTypes) => {
       onDelete: "SET NULL",
     });
 
-    // MUST stay 'userAccount' to match controller includes
+    // Keep alias in sync with controller includes
     Employee.belongsTo(models.User, {
       foreignKey: "user_id",
       as: "userAccount",
       onUpdate: "CASCADE",
-      onDelete: "SET NULL", // or 'RESTRICT' if you never delete Users
+      onDelete: "SET NULL",
     });
 
     Employee.hasMany(models.EmployeeAttendance, {
